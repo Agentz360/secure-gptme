@@ -253,17 +253,32 @@ def retry_generator_on_overloaded(max_retries: int = 5, base_delay: float = 1.0)
     """Decorator to retry generator functions on Anthropic API transient errors with exponential backoff.
 
     Handles 5xx server errors, rate limits, and other transient API issues.
+
+    Note: Retries only happen if no content has been yielded yet. Once streaming
+    has started, errors are raised immediately to prevent duplicate output.
     """
 
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
             for attempt in range(max_retries):
+                has_yielded = False
                 try:
-                    # Use 'return (yield from ...)' to propagate the generator's return value
-                    # Without 'return', the metadata returned by stream() would be lost
-                    return (yield from func(*args, **kwargs))
+                    gen = func(*args, **kwargs)
+                    while True:
+                        try:
+                            value = next(gen)
+                        except StopIteration as e:
+                            # Generator finished normally, return its value
+                            return e.value
+                        # Mark as yielded BEFORE yielding to consumer
+                        # This ensures we don't retry if consumer throws
+                        has_yielded = True
+                        yield value
                 except Exception as e:
+                    if has_yielded:
+                        # Can't retry after streaming has started - would cause duplicates
+                        raise
                     _handle_anthropic_transient_error(
                         e, attempt, max_retries, base_delay
                     )
@@ -336,7 +351,8 @@ def chat(
 ) -> tuple[str, MessageMetadata | None]:
     from anthropic import NOT_GIVEN  # fmt: skip
 
-    assert _anthropic, "LLM not initialized"
+    if not _anthropic:
+        raise RuntimeError("LLM not initialized")
     messages_dicts, system_messages, tools_dict = _prepare_messages_for_api(
         messages, tools
     )
@@ -418,7 +434,8 @@ def stream(
     # Variable to capture metadata from usage recording
     captured_metadata: MessageMetadata | None = None
 
-    assert _anthropic, "LLM not initialized"
+    if not _anthropic:
+        raise RuntimeError("LLM not initialized")
     messages_dicts, system_messages, tools_dict = _prepare_messages_for_api(
         messages, tools
     )
