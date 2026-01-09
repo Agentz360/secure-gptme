@@ -99,7 +99,7 @@ def api_conversation(logfile: str):
 
     Retrieve a conversation with all its messages and metadata.
     """
-    init_tools(None)  # FIXME: this is not thread-safe
+    init_tools(None)
     log = LogManager.load(logfile, lock=False)
     log_dict = log.to_dict(branches=True)
     # add workspace to response
@@ -184,7 +184,15 @@ def api_conversation_put(logfile: str):
     )
 
     # Add any additional messages from request
+    valid_roles = ("system", "user", "assistant")
     for msg in req_json.get("messages", []):
+        if msg.get("role") not in valid_roles:
+            return (
+                flask.jsonify(
+                    {"error": f"Invalid role: {msg.get('role')}. Must be one of: {valid_roles}"}
+                ),
+                400,
+            )
         timestamp: datetime = (
             isoparse(msg["timestamp"]) if "timestamp" in msg else datetime.now()
         )
@@ -228,11 +236,22 @@ def api_conversation_post(logfile: str):
     req_json = flask.request.json
     branch = (req_json or {}).get("branch", "main")
     tool_allowlist = (req_json or {}).get("tools", None)
-    init_tools(tool_allowlist)  # FIXME: this is not thread-safe
+    init_tools(tool_allowlist)
     log = LogManager.load(logfile, branch=branch)
     assert req_json
     assert "role" in req_json
     assert "content" in req_json
+
+    # Validate role against allowed values
+    valid_roles = ("system", "user", "assistant")
+    if req_json["role"] not in valid_roles:
+        return (
+            flask.jsonify(
+                {"error": f"Invalid role: {req_json['role']}. Must be one of: {valid_roles}"}
+            ),
+            400,
+        )
+
     msg = Message(
         req_json["role"], req_json["content"], files=req_json.get("files", [])
     )
