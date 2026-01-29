@@ -3,6 +3,8 @@ import json
 from collections.abc import Callable, Generator
 from logging import getLogger
 
+import mcp.types as mcp_types
+
 from gptme.config import Config, MCPServerConfig, get_config, set_config
 
 from ..mcp.client import MCPClient, MCPInterruptedError
@@ -32,6 +34,44 @@ _registry = MCPRegistry()
 
 # Cache of dynamically loaded servers
 _dynamic_servers: dict[str, MCPClient] = {}
+
+
+def _get_mcp_client(server_name: str) -> MCPClient | None:
+    """Get MCP client from either pre-configured or dynamically loaded servers."""
+    return _mcp_clients.get(server_name) or _dynamic_servers.get(server_name)
+
+
+def _extract_content_text(
+    item: mcp_types.TextContent
+    | mcp_types.ImageContent
+    | mcp_types.AudioContent
+    | mcp_types.ResourceLink
+    | mcp_types.EmbeddedResource
+    | str,
+) -> str:
+    """Extract text from a content item (TextContent, ImageContent, etc.).
+
+    Per MCP spec, content items can be TextContent, ImageContent, AudioContent,
+    ResourceLink, or EmbeddedResource. This function handles all types gracefully.
+    """
+    if isinstance(item, str):
+        return item
+    elif isinstance(item, mcp_types.TextContent):
+        return item.text
+    elif isinstance(item, mcp_types.ImageContent):
+        return f"[Image: {item.mimeType}]"
+    elif isinstance(item, mcp_types.AudioContent):
+        return f"[Audio: {item.mimeType}]"
+    elif isinstance(item, mcp_types.ResourceLink):
+        return f"[Resource Link: {item.uri}]"
+    elif isinstance(item, mcp_types.EmbeddedResource):
+        resource = item.resource
+        uri = str(resource.uri)
+        # TextResourceContents has text, BlobResourceContents has blob
+        if isinstance(resource, mcp_types.TextResourceContents):
+            return f"[Resource: {uri}]\n{resource.text}"
+        return f"[Resource: {uri}]"
+    return str(item)
 
 
 def _restart_mcp_client(server_name: str, config: Config) -> MCPClient:
@@ -128,15 +168,10 @@ def create_mcp_tools(config: Config) -> list[ToolSpec]:
                 # Extract parameters
                 parameters = []
                 # Check if the tool has inputSchema with properties
-                if (
-                    hasattr(mcp_tool, "inputSchema")
-                    and isinstance(mcp_tool.inputSchema, dict)
-                    and "properties" in mcp_tool.inputSchema
-                ):
-                    required_params = mcp_tool.inputSchema.get("required", [])
-                    for param_name, param_schema in mcp_tool.inputSchema[
-                        "properties"
-                    ].items():
+                input_schema = mcp_tool.inputSchema
+                if isinstance(input_schema, dict) and "properties" in input_schema:
+                    required_params = input_schema.get("required", [])
+                    for param_name, param_schema in input_schema["properties"].items():
                         parameters.append(
                             Parameter(
                                 name=param_name,
@@ -389,6 +424,13 @@ def load_mcp_server(name: str, config_override: dict | None = None) -> str:
         if "env" in config_override:
             server_config.env = config_override["env"]
 
+    # Add to config BEFORE connecting (connect() looks up server by name in config)
+    config_added = False
+    if server_config not in config.mcp.servers:
+        config.mcp.servers.append(server_config)
+        set_config(config)
+        config_added = True
+
     try:
         # Create client and connect
         client = MCPClient(config=config)
@@ -397,15 +439,14 @@ def load_mcp_server(name: str, config_override: dict | None = None) -> str:
         # Store in dynamic servers
         _dynamic_servers[name] = client
 
-        # Add to config
-        if server_config not in config.mcp.servers:
-            config.mcp.servers.append(server_config)
-            set_config(config)
-
         tool_names = [tool.name for tool in tools.tools]
         return f"Successfully loaded server '{name}' with {len(tool_names)} tools: {', '.join(tool_names)}"
 
     except Exception as e:
+        # If connection failed and we added the config, remove it to maintain consistency
+        if config_added:
+            config.mcp.servers = [s for s in config.mcp.servers if s.name != name]
+            set_config(config)
         logger.error(f"Failed to load server '{name}': {e}")
         return f"Failed to load server '{name}': {e}"
 
@@ -461,3 +502,333 @@ def list_loaded_servers() -> str:
         output.append("")
 
     return "\n".join(output)
+
+
+def list_mcp_resources(server_name: str) -> str:
+    """
+    List available resources from an MCP server.
+
+    Args:
+        server_name: Name of the loaded MCP server
+
+    Returns:
+        Formatted list of available resources
+    """
+    client = _get_mcp_client(server_name)
+    if not client:
+        return (
+            f"Server '{server_name}' is not loaded. Use `mcp load {server_name}` first."
+        )
+
+    try:
+        result = client.list_resources()
+        resources = result.resources
+
+        if not resources:
+            return f"No resources available from server '{server_name}'."
+
+        output = [f"# Resources from {server_name}\n"]
+        for resource in resources:
+            output.append(f"## {resource.name}")
+            output.append(f"**URI:** `{resource.uri}`")
+            if resource.description:
+                output.append(f"**Description:** {resource.description}")
+            if resource.mimeType:
+                output.append(f"**MIME Type:** {resource.mimeType}")
+            output.append("")
+
+        return "\n".join(output)
+    except MCPInterruptedError:
+        return "MCP operation interrupted. The server is still running."
+    except Exception as e:
+        logger.error(f"Failed to list resources from {server_name}: {e}")
+        return f"Error listing resources: {e}"
+
+
+def read_mcp_resource(server_name: str, uri: str) -> str:
+    """
+    Read a specific resource from an MCP server.
+
+    Args:
+        server_name: Name of the loaded MCP server
+        uri: URI of the resource to read
+
+    Returns:
+        Resource content as string
+    """
+    client = _get_mcp_client(server_name)
+    if not client:
+        return (
+            f"Server '{server_name}' is not loaded. Use `mcp load {server_name}` first."
+        )
+
+    try:
+        result = client.read_resource(uri)
+        contents = result.contents
+
+        if not contents:
+            return f"No content returned for resource '{uri}'."
+
+        output = []
+        for content in contents:
+            if isinstance(content, mcp_types.TextResourceContents):
+                output.append(content.text)
+            elif isinstance(content, mcp_types.BlobResourceContents):
+                # For binary content, indicate it's binary
+                output.append(f"[Binary content: {len(content.blob)} bytes]")
+            else:
+                output.append(str(content))
+
+        return "\n".join(output)
+    except MCPInterruptedError:
+        return "MCP operation interrupted. The server is still running."
+    except Exception as e:
+        logger.error(f"Failed to read resource {uri} from {server_name}: {e}")
+        return f"Error reading resource: {e}"
+
+
+def list_mcp_resource_templates(server_name: str) -> str:
+    """
+    List available resource templates from an MCP server.
+
+    Resource templates are parameterized resources like `db://table/{name}`.
+
+    Args:
+        server_name: Name of the loaded MCP server
+
+    Returns:
+        Formatted list of available resource templates
+    """
+    client = _get_mcp_client(server_name)
+    if not client:
+        return (
+            f"Server '{server_name}' is not loaded. Use `mcp load {server_name}` first."
+        )
+
+    try:
+        result = client.list_resource_templates()
+        templates = result.resourceTemplates
+
+        if not templates:
+            return f"No resource templates available from server '{server_name}'."
+
+        output = [f"# Resource Templates from {server_name}\n"]
+        for template in templates:
+            output.append(f"## {template.name}")
+            output.append(f"**URI Template:** `{template.uriTemplate}`")
+            if template.description:
+                output.append(f"**Description:** {template.description}")
+            if template.mimeType:
+                output.append(f"**MIME Type:** {template.mimeType}")
+            output.append("")
+
+        return "\n".join(output)
+    except MCPInterruptedError:
+        return "MCP operation interrupted. The server is still running."
+    except Exception as e:
+        logger.error(f"Failed to list resource templates from {server_name}: {e}")
+        return f"Error listing resource templates: {e}"
+
+
+def list_mcp_prompts(server_name: str) -> str:
+    """
+    List available prompts from an MCP server.
+
+    Args:
+        server_name: Name of the loaded MCP server
+
+    Returns:
+        Formatted list of available prompts
+    """
+    client = _get_mcp_client(server_name)
+    if not client:
+        return (
+            f"Server '{server_name}' is not loaded. Use `mcp load {server_name}` first."
+        )
+
+    try:
+        result = client.list_prompts()
+        prompts = result.prompts
+
+        if not prompts:
+            return f"No prompts available from server '{server_name}'."
+
+        output = [f"# Prompts from {server_name}\n"]
+        for prompt in prompts:
+            output.append(f"## {prompt.name}")
+            if prompt.description:
+                output.append(f"**Description:** {prompt.description}")
+            if prompt.arguments:
+                output.append("**Arguments:**")
+                for arg in prompt.arguments:
+                    required = " (required)" if arg.required else ""
+                    desc = f" - {arg.description}" if arg.description else ""
+                    output.append(f"  - `{arg.name}`{required}{desc}")
+            output.append("")
+
+        return "\n".join(output)
+    except MCPInterruptedError:
+        return "MCP operation interrupted. The server is still running."
+    except Exception as e:
+        logger.error(f"Failed to list prompts from {server_name}: {e}")
+        return f"Error listing prompts: {e}"
+
+
+def get_mcp_prompt(
+    server_name: str, name: str, arguments: dict[str, str] | None = None
+) -> str:
+    """
+    Get a specific prompt from an MCP server.
+
+    Args:
+        server_name: Name of the loaded MCP server
+        name: Name of the prompt to retrieve
+        arguments: Optional arguments for the prompt
+
+    Returns:
+        Formatted prompt content
+    """
+    client = _get_mcp_client(server_name)
+    if not client:
+        return (
+            f"Server '{server_name}' is not loaded. Use `mcp load {server_name}` first."
+        )
+
+    try:
+        result = client.get_prompt(name, arguments)
+        messages = result.messages
+
+        if not messages:
+            return f"Prompt '{name}' returned no messages."
+
+        output = [f"# Prompt: {name}\n"]
+        if result.description:
+            output.append(f"**Description:** {result.description}\n")
+
+        for i, msg in enumerate(messages):
+            output.append(f"## Message {i + 1} ({msg.role})")
+
+            content = msg.content
+            # Handle content as TextContent or ImageContent per MCP spec
+            text = _extract_content_text(content)
+            if text:
+                output.append(text)
+            output.append("")
+
+        return "\n".join(output)
+    except MCPInterruptedError:
+        return "MCP operation interrupted. The server is still running."
+    except Exception as e:
+        logger.error(f"Failed to get prompt '{name}' from {server_name}: {e}")
+        return f"Error getting prompt: {e}"
+
+
+# Roots functions - client-side configuration for MCP servers
+
+
+def list_mcp_roots(server_name: str | None = None) -> str:
+    """
+    List configured roots for MCP servers.
+
+    Roots define operational boundaries (directories, URIs) that servers can access.
+    They are advisory, helping servers understand the workspace context.
+
+    Args:
+        server_name: Optional server name. If provided, lists roots for that server only.
+                     If None, lists roots for all loaded servers.
+
+    Returns:
+        Formatted list of configured roots
+    """
+    if server_name:
+        client = _get_mcp_client(server_name)
+        if not client:
+            return f"Server '{server_name}' is not loaded. Use `mcp load {server_name}` first."
+
+        roots = client.get_roots()
+        if not roots:
+            return f"No roots configured for server '{server_name}'."
+
+        output = [f"# Roots for {server_name}\n"]
+        for root in roots:
+            output.append(f"- **{root.name or '(unnamed)'}**: `{root.uri}`")
+        return "\n".join(output)
+    else:
+        # List roots for all loaded servers
+        all_clients = {**_mcp_clients, **_dynamic_servers}
+        if not all_clients:
+            return "No MCP servers loaded."
+
+        output = ["# Configured Roots\n"]
+        for name, client in all_clients.items():
+            roots = client.get_roots()
+            output.append(f"## {name}")
+            if roots:
+                for root in roots:
+                    output.append(f"- **{root.name or '(unnamed)'}**: `{root.uri}`")
+            else:
+                output.append("_No roots configured_")
+            output.append("")
+        return "\n".join(output)
+
+
+def add_mcp_root(server_name: str, uri: str, name: str | None = None) -> str:
+    """
+    Add a root to an MCP server.
+
+    Roots tell servers what directories or URIs they can operate on.
+    After adding, the server is notified of the change.
+
+    Args:
+        server_name: Name of the loaded MCP server
+        uri: URI of the root (e.g., 'file:///path/to/project')
+        name: Optional human-readable name for the root
+
+    Returns:
+        Success message or error
+    """
+    client = _get_mcp_client(server_name)
+    if not client:
+        return (
+            f"Server '{server_name}' is not loaded. Use `mcp load {server_name}` first."
+        )
+
+    try:
+        added = client.add_root(uri, name)
+        if added:
+            return f"Added root '{name or uri}' to server '{server_name}'."
+        else:
+            return f"Root '{uri}' already exists for server '{server_name}'."
+    except Exception as e:
+        logger.error(f"Failed to add root to {server_name}: {e}")
+        return f"Error adding root: {e}"
+
+
+def remove_mcp_root(server_name: str, uri: str) -> str:
+    """
+    Remove a root from an MCP server.
+
+    After removing, the server is notified of the change.
+
+    Args:
+        server_name: Name of the loaded MCP server
+        uri: URI of the root to remove
+
+    Returns:
+        Success message or error
+    """
+    client = _get_mcp_client(server_name)
+    if not client:
+        return (
+            f"Server '{server_name}' is not loaded. Use `mcp load {server_name}` first."
+        )
+
+    try:
+        removed = client.remove_root(uri)
+        if removed:
+            return f"Removed root '{uri}' from server '{server_name}'."
+        else:
+            return f"Root '{uri}' not found in server '{server_name}'."
+    except Exception as e:
+        logger.error(f"Failed to remove root from {server_name}: {e}")
+        return f"Error removing root: {e}"

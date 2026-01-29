@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Generator
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -346,7 +347,7 @@ The shell tool will respond with the output of the execution.
 These programs are available, among others:
 {shell_programs_str}
 
-## Background Jobs
+### Background Jobs
 
 For long-running commands (dev servers, builds, etc.), use background jobs:
 - `bg <command>` - Start command in background, returns job ID
@@ -747,21 +748,25 @@ class ShellSession:
         self._init()
 
 
-_shell: ShellSession | None = None
+_shell_var: ContextVar[ShellSession | None] = ContextVar("shell", default=None)
 
 
 def get_shell() -> ShellSession:
-    global _shell
-    if _shell is None:
-        # init shell
-        _shell = ShellSession()
-    return _shell
+    """Get the shell session for the current context, creating it if necessary.
+
+    Uses ContextVar to provide context-local state, allowing each conversation
+    to have its own shell session with independent working directory.
+    """
+    shell = _shell_var.get()
+    if shell is None:
+        shell = ShellSession()
+        _shell_var.set(shell)
+    return shell
 
 
-# used in testing
 def set_shell(shell: ShellSession) -> None:
-    global _shell
-    _shell = shell
+    """Set the shell session for the current context (for testing)."""
+    _shell_var.set(shell)
 
 
 # NOTE: This does not handle control flow words like if, for, while.
@@ -1077,7 +1082,9 @@ def execute_bg_command(command: str) -> Generator[Message, None, None]:
     # Check if command is denylisted - blocked even for background jobs
     is_denied, deny_reason, matched_cmd = is_denylisted(command)
     if is_denied:
-        yield Message("system", f"Background command denied: `{matched_cmd}`\n\n{deny_reason}")
+        yield Message(
+            "system", f"Background command denied: `{matched_cmd}`\n\n{deny_reason}"
+        )
         return
 
     job = start_background_job(command)

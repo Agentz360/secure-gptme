@@ -185,7 +185,13 @@ def _handle_anthropic_transient_error(e, attempt, max_retries, base_delay):
 
     test_max_retries_str = os.environ.get("GPTME_TEST_MAX_RETRIES")
     if test_max_retries_str:
-        test_max_retries = int(test_max_retries_str)
+        try:
+            test_max_retries = int(test_max_retries_str)
+        except ValueError as parse_err:
+            raise ValueError(
+                f"Invalid GPTME_TEST_MAX_RETRIES value: {test_max_retries_str!r}. "
+                "Must be a valid integer."
+            ) from parse_err
         if attempt >= test_max_retries - 1:
             logger.warning(
                 f"Test max_retries={test_max_retries} reached (attempt {attempt + 1}), not retrying"
@@ -301,7 +307,12 @@ def init(config):
     # client use its own default behavior, which handles streaming vs non-streaming
     # requests differently and may evolve with future client versions.
     timeout_str = config.get_env("LLM_API_TIMEOUT")
-    timeout = float(timeout_str) if timeout_str else NOT_GIVEN
+    try:
+        timeout = float(timeout_str) if timeout_str else NOT_GIVEN
+    except ValueError as parse_err:
+        raise ValueError(
+            f"Invalid LLM_API_TIMEOUT value: {timeout_str!r}. Must be a valid number."
+        ) from parse_err
 
     _anthropic = Anthropic(
         api_key=api_key,
@@ -384,7 +395,14 @@ def chat(
 
     model_meta = get_model(f"anthropic/{model}")
     use_thinking = _should_use_thinking(model_meta, tools)
-    thinking_budget = int(os.environ.get(ENV_REASONING_BUDGET, "16000"))
+    thinking_budget_str = os.environ.get(ENV_REASONING_BUDGET, "16000")
+    try:
+        thinking_budget = int(thinking_budget_str)
+    except ValueError as parse_err:
+        raise ValueError(
+            f"Invalid {ENV_REASONING_BUDGET} value: {thinking_budget_str!r}. "
+            "Must be a valid integer."
+        ) from parse_err
     max_tokens = model_meta.max_output or 4096
 
     response = _anthropic.messages.create(
@@ -468,7 +486,14 @@ def stream(
     model_meta = get_model(f"anthropic/{model}")
     use_thinking = _should_use_thinking(model_meta, tools)
     # Use the same configurable thinking budget as chat()
-    thinking_budget = int(os.environ.get(ENV_REASONING_BUDGET, "16000"))
+    thinking_budget_str = os.environ.get(ENV_REASONING_BUDGET, "16000")
+    try:
+        thinking_budget = int(thinking_budget_str)
+    except ValueError as parse_err:
+        raise ValueError(
+            f"Invalid {ENV_REASONING_BUDGET} value: {thinking_budget_str!r}. "
+            "Must be a valid integer."
+        ) from parse_err
     max_tokens = model_meta.max_output or 4096
 
     with _anthropic.messages.stream(
@@ -500,20 +525,33 @@ def stream(
                     elif isinstance(block, anthropic.types.TextBlock):
                         if block.text:
                             logger.warning("unexpected text block: %s", block.text)
+                    # Note: Server-side tool use (e.g., web search) comes through as
+                    # regular ToolUseBlock with specific tool names, not special types
                     else:
                         print(f"Unknown block type: {block}")
                 case "content_block_delta":
                     chunk = cast(anthropic.types.RawContentBlockDeltaEvent, chunk)
                     delta = chunk.delta
                     if isinstance(delta, anthropic.types.TextDelta):
-                        yield delta.text
+                        if delta.text is not None:
+                            yield delta.text
                     elif isinstance(delta, anthropic.types.ThinkingDelta):
-                        yield delta.thinking
+                        if delta.thinking is not None:
+                            yield delta.thinking
                     elif isinstance(delta, anthropic.types.InputJSONDelta):
-                        yield delta.partial_json
+                        if delta.partial_json is not None:
+                            yield delta.partial_json
                     elif isinstance(delta, anthropic.types.SignatureDelta):
                         # delta.signature
                         pass
+                    elif isinstance(delta, anthropic.types.CitationsDelta):
+                        # Citation from web search results
+                        if (
+                            hasattr(delta, "citation")
+                            and delta.citation
+                            and hasattr(delta.citation, "url")
+                        ):
+                            yield f"\n📎 Source: {delta.citation.url}\n"
                     else:
                         logger.warning("Unknown delta type: %s", delta)
                 case "content_block_stop":
@@ -527,6 +565,8 @@ def stream(
                         yield "\n</think>\n\n"
                     elif isinstance(stop_block, anthropic.types.RedactedThinkingBlock):
                         yield "\n</think redacted>\n\n"
+                    # Note: Server-side tool completion comes through as regular
+                    # ToolUseBlock in the stop event, already handled above
                     else:
                         logger.warning("Unknown stop block: %s", stop_block)
                 case "text":
@@ -720,6 +760,22 @@ def _spec2tool(
     )
 
 
+def _create_web_search_tool(max_uses: int = 5) -> dict[str, Any]:
+    """Create Anthropic native web search tool definition.
+
+    Args:
+        max_uses: Maximum number of search cycles Claude can perform
+
+    Returns:
+        Tool definition for Anthropic web search
+    """
+    return {
+        "type": "web_search_20250305",
+        "name": "web_search",
+        "max_uses": max_uses,
+    }
+
+
 def _prepare_messages_for_api(
     messages: list[Message], tools: list[ToolSpec] | None
 ) -> tuple[
@@ -756,6 +812,20 @@ def _prepare_messages_for_api(
 
     # Prepare tools
     tools_dict = [_spec2tool(tool) for tool in tools] if tools else None
+
+    # Add native web search tool if enabled
+    web_search_enabled = os.environ.get("GPTME_ANTHROPIC_WEB_SEARCH", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if web_search_enabled:
+        max_uses = int(os.environ.get("GPTME_ANTHROPIC_WEB_SEARCH_MAX_USES", "5"))
+        web_search_tool = _create_web_search_tool(max_uses=max_uses)
+        if tools_dict is None:
+            tools_dict = []
+        tools_dict.append(web_search_tool)  # type: ignore
+        logger.info(f"Anthropic native web search enabled (max_uses={max_uses})")
 
     if tools_dict is not None:
         messages_dicts = _handle_tools(messages_dicts)

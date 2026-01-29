@@ -27,9 +27,17 @@ from .base import (
     ToolUse,
 )
 from .mcp_adapter import (
+    add_mcp_root,
+    get_mcp_prompt,
     get_mcp_server_info,
     list_loaded_servers,
+    list_mcp_prompts,
+    list_mcp_resource_templates,
+    list_mcp_resources,
+    list_mcp_roots,
     load_mcp_server,
+    read_mcp_resource,
+    remove_mcp_root,
     search_mcp_servers,
     unload_mcp_server,
 )
@@ -162,6 +170,106 @@ def execute_mcp(
             result = list_loaded_servers()
             yield Message("system", result)
 
+        elif command.startswith("resources list"):
+            # resources list <server-name>
+            parts = command.split()
+            if len(parts) < 3:
+                yield Message("system", "Usage: resources list <server-name>")
+                return
+
+            server_name = parts[2]
+            result = list_mcp_resources(server_name)
+            yield Message("system", result)
+
+        elif command.startswith("resources read"):
+            # resources read <server-name> <uri>
+            parts = command.split(maxsplit=3)
+            if len(parts) < 4:
+                yield Message("system", "Usage: resources read <server-name> <uri>")
+                return
+
+            server_name = parts[2]
+            uri = parts[3]
+            result = read_mcp_resource(server_name, uri)
+            yield Message("system", result)
+
+        elif command.startswith("templates list"):
+            # templates list <server-name>
+            parts = command.split()
+            if len(parts) < 3:
+                yield Message("system", "Usage: templates list <server-name>")
+                return
+
+            server_name = parts[2]
+            result = list_mcp_resource_templates(server_name)
+            yield Message("system", result)
+
+        elif command.startswith("prompts list"):
+            # prompts list <server-name>
+            parts = command.split()
+            if len(parts) < 3:
+                yield Message("system", "Usage: prompts list <server-name>")
+                return
+
+            server_name = parts[2]
+            result = list_mcp_prompts(server_name)
+            yield Message("system", result)
+
+        elif command.startswith("prompts get"):
+            # prompts get <server-name> <prompt-name> [arguments-json]
+            parts = command.split(maxsplit=4)
+            if len(parts) < 4:
+                yield Message(
+                    "system",
+                    "Usage: prompts get <server-name> <prompt-name> [arguments-json]",
+                )
+                return
+
+            server_name = parts[2]
+            prompt_name = parts[3]
+            arguments = None
+            if len(parts) > 4:
+                try:
+                    arguments = json.loads(parts[4])
+                except json.JSONDecodeError as e:
+                    yield Message("system", f"Invalid JSON arguments: {e}")
+                    return
+
+            result = get_mcp_prompt(server_name, prompt_name, arguments)
+            yield Message("system", result)
+
+        elif command.startswith("roots list"):
+            # roots list [server-name]
+            parts = command.split()
+            roots_server_name = parts[2] if len(parts) > 2 else None
+            result = list_mcp_roots(roots_server_name)
+            yield Message("system", result)
+
+        elif command.startswith("roots add"):
+            # roots add <server-name> <uri> [name]
+            parts = command.split(maxsplit=4)
+            if len(parts) < 4:
+                yield Message("system", "Usage: roots add <server-name> <uri> [name]")
+                return
+
+            add_server_name = parts[2]
+            add_uri = parts[3]
+            add_name = parts[4] if len(parts) > 4 else None
+            result = add_mcp_root(add_server_name, add_uri, add_name)
+            yield Message("system", result)
+
+        elif command.startswith("roots remove"):
+            # roots remove <server-name> <uri>
+            parts = command.split()
+            if len(parts) < 4:
+                yield Message("system", "Usage: roots remove <server-name> <uri>")
+                return
+
+            remove_server_name = parts[2]
+            remove_uri = parts[3]
+            result = remove_mcp_root(remove_server_name, remove_uri)
+            yield Message("system", result)
+
         else:
             yield Message(
                 "system",
@@ -171,7 +279,15 @@ def execute_mcp(
                 "  info <name> - Get detailed server information\n"
                 "  load <name> - Dynamically load a server\n"
                 "  unload <name> - Unload a server\n"
-                "  list - List loaded servers",
+                "  list - List loaded servers\n"
+                "  resources list <server> - List resources from a server\n"
+                "  resources read <server> <uri> - Read a resource\n"
+                "  templates list <server> - List resource templates\n"
+                "  prompts list <server> - List prompts from a server\n"
+                "  prompts get <server> <name> [args] - Get a prompt\n"
+                "  roots list [server] - List configured roots\n"
+                "  roots add <server> <uri> [name] - Add a root\n"
+                "  roots remove <server> <uri> - Remove a root",
             )
 
     except Exception as e:
@@ -195,6 +311,20 @@ def examples(tool_format: str) -> str:
                 "mcp",
                 [],
                 'load my-server\n{"command": "uvx", "args": ["my-mcp-server", "--option"]}',
+            ).to_output(fmt),
+            ToolUse("mcp", [], "resources list sqlite").to_output(fmt),
+            ToolUse("mcp", [], "resources read sqlite db://main/users").to_output(fmt),
+            ToolUse("mcp", [], "templates list sqlite").to_output(fmt),
+            ToolUse("mcp", [], "prompts list sqlite").to_output(fmt),
+            ToolUse(
+                "mcp", [], 'prompts get sqlite create-query {"table": "users"}'
+            ).to_output(fmt),
+            ToolUse("mcp", [], "roots list").to_output(fmt),
+            ToolUse(
+                "mcp", [], "roots add filesystem file:///home/user/project Project"
+            ).to_output(fmt),
+            ToolUse(
+                "mcp", [], "roots remove filesystem file:///home/user/project"
             ).to_output(fmt),
         ]
     )
@@ -246,6 +376,86 @@ def _cmd_mcp_unload(name: str) -> str:
     return unload_mcp_server(name)
 
 
+def _cmd_mcp_resources_list(server_name: str) -> str:
+    """List resources from an MCP server.
+
+    Args:
+        server_name: Name of the loaded MCP server
+    """
+    return list_mcp_resources(server_name)
+
+
+def _cmd_mcp_resources_read(server_name: str, uri: str) -> str:
+    """Read a resource from an MCP server.
+
+    Args:
+        server_name: Name of the loaded MCP server
+        uri: URI of the resource to read
+    """
+    return read_mcp_resource(server_name, uri)
+
+
+def _cmd_mcp_templates_list(server_name: str) -> str:
+    """List resource templates from an MCP server.
+
+    Args:
+        server_name: Name of the loaded MCP server
+    """
+    return list_mcp_resource_templates(server_name)
+
+
+def _cmd_mcp_prompts_list(server_name: str) -> str:
+    """List prompts from an MCP server.
+
+    Args:
+        server_name: Name of the loaded MCP server
+    """
+    return list_mcp_prompts(server_name)
+
+
+def _cmd_mcp_prompts_get(
+    server_name: str, prompt_name: str, arguments: dict[str, str] | None = None
+) -> str:
+    """Get a specific prompt from an MCP server.
+
+    Args:
+        server_name: Name of the loaded MCP server
+        prompt_name: Name of the prompt to retrieve
+        arguments: Optional arguments for the prompt
+    """
+    return get_mcp_prompt(server_name, prompt_name, arguments)
+
+
+def _cmd_mcp_roots_list(server_name: str | None = None) -> str:
+    """List configured roots for MCP servers.
+
+    Args:
+        server_name: Optional server name to list roots for
+    """
+    return list_mcp_roots(server_name)
+
+
+def _cmd_mcp_roots_add(server_name: str, uri: str, name: str | None = None) -> str:
+    """Add a root to an MCP server.
+
+    Args:
+        server_name: Name of the loaded MCP server
+        uri: URI of the root (e.g., file:///path/to/project)
+        name: Optional human-readable name
+    """
+    return add_mcp_root(server_name, uri, name)
+
+
+def _cmd_mcp_roots_remove(server_name: str, uri: str) -> str:
+    """Remove a root from an MCP server.
+
+    Args:
+        server_name: Name of the loaded MCP server
+        uri: URI of the root to remove
+    """
+    return remove_mcp_root(server_name, uri)
+
+
 tool = ToolSpec(
     name="mcp",
     desc="Search, discover, and manage MCP servers",
@@ -255,6 +465,22 @@ This tool allows you to search for MCP servers in various registries and dynamic
 Once loaded, server tools are available as `<server-name>.<tool-name>`.
 
 Search queries the Official MCP Registry (registry.modelcontextprotocol.io).
+
+**Resource Commands** (for servers that expose resources):
+- `resources list <server>` - List available resources from a loaded server
+- `resources read <server> <uri>` - Read a specific resource by URI
+- `templates list <server>` - List resource templates (parameterized resources)
+
+**Prompt Commands** (for servers that expose prompts):
+- `prompts list <server>` - List available prompts from a loaded server
+- `prompts get <server> <name> [args]` - Get a specific prompt, optionally with JSON arguments
+
+**Roots Commands** (for defining operational boundaries):
+- `roots list [server]` - List configured roots (all servers if no server specified)
+- `roots add <server> <uri> [name]` - Add a root to tell the server where it can operate
+- `roots remove <server> <uri>` - Remove a root from a server
+
+Roots are advisory URIs (file paths, HTTP URLs) that help servers understand workspace boundaries.
 """.strip(),
     examples=examples,
     execute=execute_mcp,
@@ -265,12 +491,20 @@ Search queries the Official MCP Registry (registry.modelcontextprotocol.io).
         "mcp list": _cmd_mcp_list,
         "mcp load": _cmd_mcp_load,
         "mcp unload": _cmd_mcp_unload,
+        "mcp resources list": _cmd_mcp_resources_list,
+        "mcp resources read": _cmd_mcp_resources_read,
+        "mcp templates list": _cmd_mcp_templates_list,
+        "mcp prompts list": _cmd_mcp_prompts_list,
+        "mcp prompts get": _cmd_mcp_prompts_get,
+        "mcp roots list": _cmd_mcp_roots_list,
+        "mcp roots add": _cmd_mcp_roots_add,
+        "mcp roots remove": _cmd_mcp_roots_remove,
     },
     parameters=[
         Parameter(
             name="command",
             type="string",
-            description="MCP management command (search, info, load, unload, list)",
+            description="MCP management command (search, info, load, unload, list, resources list, resources read, templates list)",
             required=True,
         ),
     ],

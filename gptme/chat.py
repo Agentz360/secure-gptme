@@ -9,6 +9,7 @@ from pathlib import Path
 from .commands import execute_cmd
 from .config import ChatConfig, get_config
 from .constants import (
+    DECLINED_CONTENT,
     INTERRUPT_CONTENT,
     MAX_MESSAGE_LENGTH,
     MAX_PROMPT_QUEUE_SIZE,
@@ -41,9 +42,6 @@ from .util.terminal import set_current_conv_name, terminal_state_title
 
 logger = logging.getLogger(__name__)
 
-# Global flag to track if we were recently interrupted
-_recently_interrupted = False
-
 
 @trace_function(name="chat.main", attributes={"component": "chat"})
 def chat(
@@ -69,9 +67,6 @@ def chat(
 
     Callable from other modules.
     """
-    global _recently_interrupted
-    _recently_interrupted = False
-
     # Set initial terminal title with conversation name
     conv_name = logdir.name
     set_current_conv_name(conv_name)
@@ -100,8 +95,15 @@ def chat(
             initial_msgs = initial_msgs + [hook_msg]
 
     default_model = get_default_model()
-    assert default_model is not None, "No model loaded and no model specified"
-    modelmeta = get_model(model or default_model.full)
+    # Only require default_model if no explicit model was passed
+    # Use nested if/else for proper mypy type narrowing
+    if model is None:
+        if default_model is None:
+            raise AssertionError("No model loaded and no model specified")
+        model_to_use = default_model.full
+    else:
+        model_to_use = model
+    modelmeta = get_model(model_to_use)
     if not modelmeta.supports_streaming and stream:
         logger.info(
             "Disabled streaming for '%s/%s' model (not supported)",
@@ -305,8 +307,6 @@ def _process_message_conversation(
             )
         except KeyboardInterrupt:
             console.log("Interrupted during response generation.")
-            global _recently_interrupted
-            _recently_interrupted = True
             manager.append(Message("system", INTERRUPT_CONTENT))
             break
         finally:
@@ -320,12 +320,20 @@ def _process_message_conversation(
             ):
                 return
 
+        # Check if user declined execution - return to prompt without generating response
+        # This makes "n" at confirm prompt behave like Ctrl+C (return to user prompt)
+        if any(msg.content == DECLINED_CONTENT for msg in response_msgs):
+            console.log("Execution declined, returning to prompt.")
+            break
+
         # Auto-generate display name after first assistant response if not already set
         # Runs in background thread to avoid blocking the chat loop
         # TODO: Consider implementing via hook system to streamline with server implementation
         # See: gptme/server/api_v2_sessions.py for server's implementation
+        # Try auto-naming on first few assistant messages until we get a name
+        # This allows retry when initial context is insufficient
         assistant_messages = [m for m in manager.log.messages if m.role == "assistant"]
-        if len(assistant_messages) == 1:
+        if len(assistant_messages) <= 3:
             chat_config = ChatConfig.from_logdir(manager.logdir)
             if not chat_config.name:
 
@@ -388,26 +396,26 @@ def _should_prompt_for_input(log: Log) -> bool:
     """
     last_msg = log[-1] if log else None
 
-    # Check if there's an interrupt message after the last assistant message
-    # This handles cases where hooks (like cost_awareness) add messages after the interrupt
-    has_recent_interrupt = False
+    # Check if there's an interrupt or decline message after the last assistant message
+    # This handles cases where hooks (like cost_awareness) add messages after the interrupt/decline
+    has_recent_interrupt_or_decline = False
     for msg in reversed(log):
         if msg.role == "assistant":
             break
-        if msg.content == INTERRUPT_CONTENT:
-            has_recent_interrupt = True
+        if msg.content in (INTERRUPT_CONTENT, DECLINED_CONTENT):
+            has_recent_interrupt_or_decline = True
             break
 
     # Ask for input when:
     # - No messages at all
     # - Last message was from assistant (normal flow)
-    # - There was an interrupt after the last assistant message
+    # - There was an interrupt or decline after the last assistant message
     # - Last message was pinned
     # - No user messages exist in the entire log
     return (
         not last_msg
         or (last_msg.role in ["assistant"])
-        or has_recent_interrupt
+        or has_recent_interrupt_or_decline
         or last_msg.pinned
         or not any(role == "user" for role in [m.role for m in log])
     )
@@ -461,11 +469,13 @@ def step(
     output_schema: type | None = None,
 ) -> Generator[Message, None, None]:
     """Runs a single pass of the chat - generates response and executes tools."""
-    global _recently_interrupted
-
     default_model = get_default_model()
-    assert default_model is not None, "No model loaded and no model specified"
-    model = model or default_model.full
+    # Only require default_model if no explicit model was passed
+    # Use nested if/else for proper mypy type narrowing
+    if model is None:
+        if default_model is None:
+            raise AssertionError("No model loaded and no model specified")
+        model = default_model.full
     if isinstance(log, list):
         log = Log(log)
 
@@ -502,9 +512,6 @@ def step(
             yield msg_response.replace(quiet=True)
             yield from execute_msg(msg_response, confirm, log, workspace)
 
-        # Reset interrupt flag after successful completion
-        _recently_interrupted = False
-
     finally:
         clear_interruptible()
 
@@ -525,8 +532,7 @@ def prompt_user(value=None) -> str:  # pragma: no cover
             except KeyboardInterrupt:
                 print("\nInterrupted. Press Ctrl-D to exit.")
             except EOFError:
-                print("\nGoodbye!")
-                sys.exit(0)
+                raise  # Let _get_user_input handle the normal exit flow
     clear_interruptible()
     return response
 

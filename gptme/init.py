@@ -5,6 +5,7 @@ from typing import cast
 from dotenv import load_dotenv
 from rich.logging import RichHandler
 
+from .cli.setup import ask_for_api_key
 from .commands import init_commands
 from .config import get_config
 from .hooks import init_hooks
@@ -16,7 +17,6 @@ from .llm.models import (
     get_recommended_model,
     set_default_model,
 )
-from .setup import ask_for_api_key
 from .tools import ToolFormat, init_tools, set_tool_format
 from .util import console
 
@@ -119,6 +119,19 @@ def init_logging(verbose):
     # set httpx logging to WARNING
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    # Apply debouncing filter for OpenTelemetry connection errors
+    # This shows the first error, then suppresses duplicates for 5 minutes
+    # Prevents spam while still alerting users to telemetry issues
+    # Uses singleton filter to share state with setup_telemetry() filters
+    try:
+        from .util._telemetry import get_connection_error_filter
+
+        otel_filter = get_connection_error_filter(cooldown_seconds=300.0)
+        logging.getLogger("opentelemetry").addFilter(otel_filter)
+    except ImportError:
+        # OpenTelemetry not installed, no need for filter
+        pass
 
     # Register cleanup handler
 
