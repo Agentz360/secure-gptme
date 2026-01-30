@@ -125,6 +125,11 @@ class UserConfig:
     env: dict[str, str] = field(default_factory=dict)
     mcp: MCPConfig | None = None
     providers: list[ProviderConfig] = field(default_factory=list)
+    lessons: "LessonsConfig | None" = None
+
+    # Plugin-specific configuration namespace (user-level)
+    # Allows plugins to have their own config sections like [plugin.retrieval]
+    plugin: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -146,6 +151,7 @@ class AgentConfig:
     """Configuration for agent-specific settings."""
 
     name: str
+    avatar: str | None = None
 
 
 @dataclass
@@ -176,6 +182,11 @@ class ProjectConfig:
     context: ContextConfig = field(default_factory=ContextConfig)
 
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
+
+    # Plugin-specific configuration namespace
+    # Allows plugins to have their own config sections like [plugin.retrieval]
+    # These are preserved as raw dicts for plugins to validate and use
+    plugin: dict[str, dict] = field(default_factory=dict)
 
     env: dict[str, str] = field(default_factory=dict)
     mcp: MCPConfig | None = None
@@ -231,6 +242,14 @@ class ProjectConfig:
         if mcp := config_data.pop("mcp", None):
             mcp = MCPConfig.from_dict(mcp)
 
+        # Extract plugin-prefixed keys (e.g., [plugin.retrieval] -> plugin["retrieval"])
+        # This allows plugins to have their own config sections without triggering warnings
+        plugin_config: dict[str, dict] = {}
+        if plugin_data := config_data.pop("plugin", None):
+            # Handle [plugin] section with nested subsections
+            if isinstance(plugin_data, dict):
+                plugin_config = plugin_data
+
         # Check for unknown keys
         if config_data:
             logger.warning(f"Unknown keys in project config: {config_data.keys()}")
@@ -246,6 +265,7 @@ class ProjectConfig:
             lessons=lessons,
             context=context,
             plugins=plugins,
+            plugin=plugin_config,
             env=env,
             mcp=mcp,
             **config_data,
@@ -319,10 +339,32 @@ def load_user_config(path: str | None = None) -> UserConfig:
     providers_config = config.pop("providers", [])
     providers = [ProviderConfig(**provider) for provider in providers_config]
 
+    # Parse lessons config
+    lessons_data = config.pop("lessons", None)
+    lessons = (
+        LessonsConfig(dirs=lessons_data.get("dirs", []))
+        if lessons_data and isinstance(lessons_data, dict)
+        else None
+    )
+
+    # Extract plugin-prefixed keys (e.g., [plugin.retrieval] -> plugin["retrieval"])
+    # This allows plugins to have their own config sections without triggering warnings
+    plugin_config: dict[str, dict] = {}
+    if plugin_data := config.pop("plugin", None):
+        if isinstance(plugin_data, dict):
+            plugin_config = plugin_data
+
     if config:
         logger.warning(f"Unknown keys in config: {config.keys()}")
 
-    return UserConfig(prompt=prompt, env=env, mcp=mcp, providers=providers)
+    return UserConfig(
+        prompt=prompt,
+        env=env,
+        mcp=mcp,
+        providers=providers,
+        lessons=lessons,
+        plugin=plugin_config,
+    )
 
 
 def _load_config_doc(path: str | None = None) -> tomlkit.TOMLDocument:
