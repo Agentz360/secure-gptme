@@ -367,8 +367,14 @@ def _handle_openai_transient_error(e, attempt, max_retries, base_delay):
     - 5xx server errors (500-599): Internal errors, bad gateway, service unavailable, etc.
     - 429 rate limit errors: Should back off and retry
     - Connection errors: Network issues, timeouts
+    - httpx transport/protocol errors: Incomplete reads, server disconnects mid-stream
     """
     from openai import APIConnectionError, APIStatusError, RateLimitError  # fmt: skip
+
+    try:
+        import httpx
+    except ImportError:
+        httpx = None  # type: ignore
 
     # Allow tests to override max_retries via environment variable
     # This breaks out of the retry loop early to prevent test timeouts
@@ -389,6 +395,9 @@ def _handle_openai_transient_error(e, attempt, max_retries, base_delay):
         should_retry = True
     elif isinstance(e, APIConnectionError):
         # Connection errors are transient
+        should_retry = True
+    elif httpx is not None and isinstance(e, httpx.NetworkError | httpx.ProtocolError):
+        # httpx transport/protocol errors (server disconnects mid-stream, incomplete reads)
         should_retry = True
     elif isinstance(e, APIStatusError):
         # Retry on all 5xx server errors (transient)
@@ -1126,7 +1135,16 @@ def openrouter_model_to_modelmeta(model_data: dict) -> ModelMeta:
     pricing = model_data.get("pricing", {})
     price_input = float(pricing.get("prompt", 0)) * 1_000_000
     price_output = float(pricing.get("completion", 0)) * 1_000_000
-    vision = "vision" in model_data.get("architecture", {}).get("modality", "")
+    # Check for vision support: look for "image" in input modalities
+    # OpenRouter uses modalities like "text+image->text" (not "vision")
+    architecture = model_data.get("architecture", {})
+    input_modalities = architecture.get("input_modalities", [])
+    vision = "image" in input_modalities
+    if not vision and not input_modalities:
+        # Fallback: parse input side of modality string (before "->")
+        modality = architecture.get("modality", "")
+        input_side = modality.split("->")[0] if "->" in modality else ""
+        vision = "image" in input_side
     reasoning = "reasoning" in model_data.get("supported_parameters", [])
     include_reasoning = "include_reasoning" in model_data.get(
         "supported_parameters", []
