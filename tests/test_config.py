@@ -12,6 +12,7 @@ from gptme.config import (
     Config,
     MCPConfig,
     ProjectConfig,
+    UserIdentityConfig,
     get_config,
     load_user_config,
     setup_config_from_cli,
@@ -750,3 +751,176 @@ def test_reload_config_clears_tools(monkeypatch, tmp_path):
 
     # Verify clear_tools was called
     assert mock_clear_tools.called, "reload_config() should call clear_tools()"
+
+
+def test_user_identity_config_new_format():
+    """Test that [user] section is parsed correctly."""
+    config_toml = """
+[user]
+name = "Erik"
+about = "I am a curious human programmer."
+response_preference = "Basic concepts don't need to be explained."
+
+[prompt]
+[prompt.project]
+myproject = "A cool project."
+
+[env]
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+        f.write(config_toml)
+        f.flush()
+        try:
+            config = load_user_config(f.name)
+            assert config.user.name == "Erik"
+            assert config.user.about == "I am a curious human programmer."
+            assert (
+                config.user.response_preference
+                == "Basic concepts don't need to be explained."
+            )
+            assert config.prompt.project == {"myproject": "A cool project."}
+        finally:
+            os.remove(f.name)
+
+
+def test_user_identity_config_backward_compat():
+    """Test that old [prompt] about_user/response_preference still works as fallback."""
+    config_toml = """
+[prompt]
+about_user = "I am a legacy user."
+response_preference = "Keep it short."
+
+[env]
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+        f.write(config_toml)
+        f.flush()
+        try:
+            config = load_user_config(f.name)
+            # Should fall back to [prompt] values
+            assert config.user.name == "User"
+            assert config.user.about == "I am a legacy user."
+            assert config.user.response_preference == "Keep it short."
+        finally:
+            os.remove(f.name)
+
+
+def test_user_identity_config_new_overrides_old():
+    """Test that [user] values take priority over [prompt] fallback."""
+    config_toml = """
+[user]
+name = "Erik"
+about = "New about text."
+response_preference = "New preference."
+
+[prompt]
+about_user = "Old about text."
+response_preference = "Old preference."
+
+[env]
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+        f.write(config_toml)
+        f.flush()
+        try:
+            config = load_user_config(f.name)
+            # [user] should take priority
+            assert config.user.name == "Erik"
+            assert config.user.about == "New about text."
+            assert config.user.response_preference == "New preference."
+        finally:
+            os.remove(f.name)
+
+
+def test_user_identity_config_defaults():
+    """Test that UserIdentityConfig has sensible defaults."""
+    identity = UserIdentityConfig()
+    assert identity.name == "User"
+    assert identity.about is None
+    assert identity.response_preference is None
+
+
+def test_user_identity_config_partial_fallback():
+    """Test that fallback works per-field."""
+    config_toml = """
+[user]
+name = "Erik"
+about = "Custom about."
+
+[prompt]
+response_preference = "Fallback preference."
+
+[env]
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+        f.write(config_toml)
+        f.flush()
+        try:
+            config = load_user_config(f.name)
+            assert config.user.name == "Erik"
+            assert config.user.about == "Custom about."
+            assert config.user.response_preference == "Fallback preference."
+        finally:
+            os.remove(f.name)
+
+
+def test_user_config_local_toml(tmp_path):
+    """Test that config.local.toml is merged into the user config."""
+    # Create main config with preferences (committable to dotfiles)
+    main_config = tmp_path / "config.toml"
+    main_config.write_text(
+        '[prompt]\nabout_user = "I am a developer."\n\n' "[env]\n" 'EDITOR = "vim"\n'
+    )
+
+    # Create local config with secrets (gitignored)
+    local_config = tmp_path / "config.local.toml"
+    local_config.write_text(
+        "[env]\n" 'OPENAI_API_KEY = "sk-secret-123"\n' 'EDITOR = "nvim"\n'
+    )
+
+    user_config = load_user_config(str(main_config))
+
+    # Local env values should be merged in, overriding main where they overlap
+    # (check user.env directly to avoid os.environ interference in CI)
+    assert user_config.env["OPENAI_API_KEY"] == "sk-secret-123"
+    assert user_config.env["EDITOR"] == "nvim"
+
+    # Non-overlapping values from main config should be preserved
+    assert user_config.prompt.about_user == "I am a developer."
+
+
+def test_user_config_local_toml_mcp_merge(tmp_path):
+    """Test that config.local.toml merges MCP server env vars into main config."""
+    main_config = tmp_path / "config.toml"
+    main_config.write_text(
+        "[prompt]\n\n"
+        "[mcp]\nenabled = true\nauto_start = true\n\n"
+        "[[mcp.servers]]\n"
+        'name = "my-server"\n'
+        'command = "server-cmd"\n'
+        'args = ["--arg1"]\n'
+    )
+
+    local_config = tmp_path / "config.local.toml"
+    local_config.write_text(
+        "[[mcp.servers]]\n" 'name = "my-server"\n' 'env = { API_KEY = "secret-key" }\n'
+    )
+
+    config = Config(user=load_user_config(str(main_config)))
+
+    assert config.mcp.enabled is True
+    assert len(config.mcp.servers) == 1
+    server = config.mcp.servers[0]
+    assert server.name == "my-server"
+    assert server.command == "server-cmd"
+    assert server.env == {"API_KEY": "secret-key"}
+
+
+def test_user_config_no_local_toml(tmp_path):
+    """Test that missing config.local.toml doesn't cause errors."""
+    main_config = tmp_path / "config.toml"
+    main_config.write_text('[prompt]\nabout_user = "I am a developer."\n\n[env]\n')
+
+    # Should work fine without config.local.toml
+    config = Config(user=load_user_config(str(main_config)))
+    assert config.user.prompt.about_user == "I am a developer."

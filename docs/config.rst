@@ -22,9 +22,18 @@ Here is an example:
 
 .. code-block:: toml
 
-    [prompt]
-    about_user = "I am a curious human programmer."
+    [user]
+    name = "Erik"
+    about = "I am a curious human programmer."
     response_preference = "Don't explain basic concepts"
+
+    [prompt]
+    # Additional files to always include in context
+    files = ["~/notes/llm-tips.md"]
+
+    # Project descriptions (optional)
+    #[prompt.project]
+    #myproject = "A description of my project."
 
     [env]
     # Uncomment to use Claude 3.5 Sonnet by default
@@ -49,13 +58,48 @@ Here is an example:
     #TOOL_ALLOWLIST = "save,append,patch,ipython,shell,browser"  # Comma separated list of allowed tools
     #TOOL_MODULES = "gptme.tools,custom.tools" # List of python comma separated python module path
 
-The ``prompt`` section contains options for the prompt.
+The ``user`` section configures user identity:
+
+- ``name``: Your display name, shown at the CLI input prompt (default: ``"User"``).
+- ``about``: A description of yourself, included in the system prompt so the assistant knows who it's talking to.
+- ``response_preference``: Preferences for how the assistant should respond (e.g. level of detail).
+
+.. note::
+
+    For backward compatibility, ``about_user`` and ``response_preference`` under the ``[prompt]`` section are still supported as fallbacks if not set in ``[user]``.
+
+The ``prompt`` section contains options included in both interactive and non-interactive runs:
+
+- ``files``: A list of additional files to always include in context. Supports absolute paths, ``~`` expansion, and paths relative to the config directory.
+- ``project``: A table of project descriptions, keyed by project name, included when working in the matching Git repository.
 
 The ``env`` section contains environment variables that gptme will fall back to if they are not set in the shell environment. This is useful for setting the default model and API keys for :doc:`providers`. It can also be used to set default tool configuration options, see :doc:`custom_tool` for more information.
 
 If you want to configure MCP servers, you can do so in a ``mcp`` section. See :ref:`mcp` for more information.
 
 See :class:`gptme.config.UserConfig` for the API reference.
+
+.. _global-config-local:
+
+Local overrides (``config.local.toml``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+You can create a ``config.local.toml`` in the same directory (``~/.config/gptme/``) to override or extend values from ``config.toml``. This is useful for keeping secrets (API keys, MCP server credentials) separate from preferences you might commit to your dotfiles.
+
+Example ``config.local.toml``:
+
+.. code-block:: toml
+
+    [env]
+    OPENAI_API_KEY = "sk-..."
+    ANTHROPIC_API_KEY = "sk-ant-..."
+
+    # Add secret env vars to an MCP server defined in config.toml
+    [[mcp.servers]]
+    name = "my-server"
+    env = { API_KEY = "secret-key" }
+
+Values in ``config.local.toml`` are merged into the main config: dictionary sections are merged recursively, and MCP servers are merged by name (so you can define the server command/args in ``config.toml`` and add secrets in ``config.local.toml``). Scalar values in the local file override the main file.
 
 .. _project-config:
 
@@ -114,6 +158,19 @@ This file currently supports a few options:
 - ``mcp``, MCP server configuration for this project. See :ref:`mcp` for more information.
 
 See :class:`gptme.config.ProjectConfig` for the API reference.
+
+.. _project-config-local:
+
+Local overrides (``gptme.local.toml``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+You can create a ``gptme.local.toml`` file next to ``gptme.toml`` to override or extend the project config with values you don't want to commit to version control (e.g. secrets for MCP servers, personal env vars).
+
+The merging behavior is the same as for the :ref:`global local config <global-config-local>`: dictionaries merge recursively, MCP servers merge by name, and scalar values in the local file override the main file.
+
+.. tip::
+
+    Add ``gptme.local.toml`` to your ``.gitignore`` to keep secrets out of version control.
 
 
 .. _chat-config:
