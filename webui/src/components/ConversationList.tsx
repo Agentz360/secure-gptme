@@ -15,7 +15,7 @@ type MessageBreakdown = Partial<Record<MessageRole, number>>;
 
 interface Props {
   conversations: ConversationSummary[];
-  onSelect: (id: string) => void;
+  onSelect: (id: string, serverId?: string) => void;
   isLoading?: boolean;
   isFetching?: boolean;
   isError?: boolean;
@@ -24,6 +24,7 @@ interface Props {
   fetchNextPage: () => void;
   hasNextPage?: boolean;
   selectedId$?: Observable<string | null>;
+  showServerLabels?: boolean;
 }
 
 export const ConversationList: FC<Props> = ({
@@ -37,6 +38,7 @@ export const ConversationList: FC<Props> = ({
   fetchNextPage,
   hasNextPage = false,
   selectedId$,
+  showServerLabels = false,
 }) => {
   const { isConnected$ } = useApi();
   const isConnected = use$(isConnected$);
@@ -102,7 +104,10 @@ export const ConversationList: FC<Props> = ({
     return match ? match[1] : name;
   }
 
-  const ConversationItem: FC<{ conv: ConversationSummary }> = ({ conv }) => {
+  const ConversationItem: FC<{ conv: ConversationSummary; showLabel?: boolean }> = ({
+    conv,
+    showLabel,
+  }) => {
     // For demo conversations, get messages from demoConversations
     const demoConv = demoConversations.find((dc) => dc.id === conv.id);
 
@@ -156,7 +161,7 @@ export const ConversationList: FC<Props> = ({
               className={`cursor-pointer rounded-lg py-2 pl-2 transition-colors hover:bg-accent ${
                 isSelected ? 'bg-accent' : ''
               }`}
-              onClick={() => onSelect(conv.id)}
+              onClick={() => onSelect(conv.id, conv.serverId)}
             >
               <div>
                 <div
@@ -261,6 +266,11 @@ export const ConversationList: FC<Props> = ({
                       </Tooltip>
                     )}
                   </div>
+                  {showLabel && conv.serverName && (
+                    <span className="ml-auto rounded bg-muted px-1 py-0.5 text-[10px]">
+                      {conv.serverName}
+                    </span>
+                  )}
                 </div>
               </div>
             </div>
@@ -308,7 +318,13 @@ export const ConversationList: FC<Props> = ({
       {/* Render conversations */}
       {!isLoading &&
         !isError &&
-        conversations.map((conv) => <ConversationItem key={conv.id} conv={conv} />)}
+        conversations.map((conv) => (
+          <ConversationItem
+            key={conv.serverId ? `${conv.serverId}:${conv.id}` : conv.id}
+            conv={conv}
+            showLabel={showServerLabels}
+          />
+        ))}
 
       {/* Loading indicator for fetching more */}
       {isFetching && !isLoading && (

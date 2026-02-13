@@ -3,31 +3,41 @@ import { useRef, useEffect } from 'react';
 import { ChatMessage } from './ChatMessage';
 import { ChatInput, type ChatOptions } from './ChatInput';
 import { useConversation } from '@/hooks/useConversation';
-import { Checkbox } from './ui/checkbox';
-import { Label } from './ui/label';
+
 import { InlineToolConfirmation } from './InlineToolConfirmation';
 import { InlineToolExecution } from './InlineToolExecution';
-import { For, Memo, useObservable, useObserveEffect } from '@legendapp/state/react';
+import { For, useObservable, useObserveEffect } from '@legendapp/state/react';
 import { getObservableIndex } from '@legendapp/state';
 import { useApi } from '@/contexts/ApiContext';
+import { useSettings } from '@/contexts/SettingsContext';
 import { useModels } from '@/hooks/useModels';
 
 interface Props {
   conversationId: string;
+  serverId?: string;
   isReadOnly?: boolean;
 }
 
-export const ConversationContent: FC<Props> = ({ conversationId, isReadOnly }) => {
-  const { conversation$, sendMessage, confirmTool, interruptGeneration } =
-    useConversation(conversationId);
+export const ConversationContent: FC<Props> = ({ conversationId, serverId, isReadOnly }) => {
+  const { conversation$, sendMessage, confirmTool, interruptGeneration } = useConversation(
+    conversationId,
+    serverId
+  );
   // State to track when to auto-focus the input
   const shouldFocus$ = useObservable(false);
   // Store the previous conversation ID to detect changes
   const prevConversationIdRef = useRef<string | null>(null);
 
-  const { api } = useApi();
+  const { api, connectionConfig } = useApi();
   const hasSession$ = useObservable<boolean>(false);
   const { defaultModel } = useModels();
+
+  // Fetch user info once (cached in ApiClient)
+  useEffect(() => {
+    if (api.isConnected$.get()) {
+      api.getUserInfo().catch(() => {});
+    }
+  }, [api]);
 
   useObserveEffect(api.sessions$.get(conversationId), () => {
     if (!isReadOnly) {
@@ -79,15 +89,22 @@ export const ConversationContent: FC<Props> = ({ conversationId, isReadOnly }) =
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId]);
 
-  const showInitialSystem$ = useObservable<boolean>(false);
+  // Import settings from global context
+  const { settings } = useSettings();
 
-  const hasInitialSystemMessages$ = useObservable(() => {
-    const log = conversation$.get()?.data.log;
-    if (!log || log.length === 0) {
-      return false;
-    }
-    return log[0].role === 'system';
-  });
+  // Create observables for settings that need to be reactive in the For loop
+  // (Legend State's <For> only re-renders on observable changes, not React state)
+  const showInitialSystem$ = useObservable(settings.showInitialSystem);
+  const showHiddenMessages$ = useObservable(settings.showHiddenMessages);
+
+  // Sync observables when settings change
+  useEffect(() => {
+    showInitialSystem$.set(settings.showInitialSystem);
+  }, [settings.showInitialSystem, showInitialSystem$]);
+
+  useEffect(() => {
+    showHiddenMessages$.set(settings.showHiddenMessages);
+  }, [settings.showHiddenMessages, showHiddenMessages$]);
 
   // Create a ref for the scroll container
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -175,29 +192,6 @@ export const ConversationContent: FC<Props> = ({ conversationId, isReadOnly }) =
           }
         }}
       >
-        <Memo>
-          {() =>
-            hasInitialSystemMessages$.get() && (
-              <div className="flex w-full items-center bg-accent/50">
-                <div className="mx-auto flex max-w-3xl flex-1 items-center gap-2 p-4">
-                  <Checkbox
-                    id="showInitialSystem"
-                    checked={showInitialSystem$.get()}
-                    onCheckedChange={(checked) => {
-                      showInitialSystem$.set(checked === true);
-                    }}
-                  />
-                  <Label
-                    htmlFor="showInitialSystem"
-                    className="cursor-pointer text-sm text-muted-foreground hover:text-foreground"
-                  >
-                    Show initial system messages
-                  </Label>
-                </div>
-              </div>
-            )
-          }
-        </Memo>
         <For each={conversation$.data.log}>
           {(msg$) => {
             const index = getObservableIndex(msg$);
@@ -211,13 +205,42 @@ export const ConversationContent: FC<Props> = ({ conversationId, isReadOnly }) =
             }
 
             // Hide messages with hide=true (e.g., auto-included lessons)
-            if (msg$.hide?.get()) {
+            if (msg$.hide?.get() && !showHiddenMessages$.get()) {
               return <div key={`${index}-${msg$.timestamp.get()}`} />;
             }
 
-            // Get the previous and next messages for spacing context
-            const previousMessage$ = index > 0 ? conversation$.data.log[index - 1] : undefined;
-            const nextMessage$ = conversation$.data.log[index + 1];
+            // Helper to check if a message at a given index is hidden
+            const isHiddenAt = (idx: number) => {
+              const m = conversation$.data.log[idx];
+              if (!m?.get()) return false;
+              const r = m.role.get();
+              const h = m.hide?.get();
+              const isInitial =
+                r === 'system' && (firstNonSystemIndex === -1 || idx < firstNonSystemIndex);
+              if (isInitial && !showInitialSystem$.get()) return true;
+              if (h && !showHiddenMessages$.get()) return true;
+              return false;
+            };
+
+            // Get the previous and next *visible* messages for chain context
+            // (skip hidden messages so they don't break chain grouping)
+            let prevIdx = index - 1;
+            while (prevIdx >= 0 && isHiddenAt(prevIdx)) prevIdx--;
+            const previousMessage$ = prevIdx >= 0 ? conversation$.data.log[prevIdx] : undefined;
+
+            let nextIdx = index + 1;
+            while (conversation$.data.log[nextIdx]?.get() && isHiddenAt(nextIdx)) nextIdx++;
+            const nextMessage$ = conversation$.data.log[nextIdx]?.get()
+              ? conversation$.data.log[nextIdx]
+              : undefined;
+
+            // Construct agent avatar URL if agent has avatar configured
+            // NOTE: must use .get() to read actual values from Legend State observables
+            const baseUrl = connectionConfig.baseUrl.replace(/\/+$/, '');
+            const agentAvatarUrl = conversation$.data.agent?.avatar?.get()
+              ? `${baseUrl}/api/v2/conversations/${conversationId}/agent/avatar`
+              : undefined;
+            const agentName = conversation$.data.agent?.name?.get();
 
             return (
               <ChatMessage
@@ -226,6 +249,8 @@ export const ConversationContent: FC<Props> = ({ conversationId, isReadOnly }) =
                 previousMessage$={previousMessage$}
                 nextMessage$={nextMessage$}
                 conversationId={conversationId}
+                agentAvatarUrl={agentAvatarUrl}
+                agentName={agentName}
               />
             );
           }}

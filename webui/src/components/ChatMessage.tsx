@@ -14,6 +14,8 @@ interface Props {
   previousMessage$?: Observable<Message | undefined>;
   nextMessage$?: Observable<Message | undefined>;
   conversationId: string;
+  agentAvatarUrl?: string;
+  agentName?: string;
 }
 
 export const ChatMessage: FC<Props> = ({
@@ -21,8 +23,10 @@ export const ChatMessage: FC<Props> = ({
   previousMessage$,
   nextMessage$,
   conversationId,
+  agentAvatarUrl,
+  agentName,
 }) => {
-  const { connectionConfig } = useApi();
+  const { api, connectionConfig } = useApi();
   const { settings } = useSettings();
 
   const contentRef = useRef<HTMLDivElement>(null);
@@ -219,6 +223,14 @@ export const ChatMessage: FC<Props> = ({
                   isError$={isError$}
                   isSuccess$={isSuccess$}
                   chainType$={chainType$}
+                  agentAvatarUrl={agentAvatarUrl}
+                  agentName={agentName}
+                  userAvatarUrl={
+                    api.userInfo$.avatar?.get()
+                      ? `${connectionConfig.baseUrl.replace(/\/+$/, '')}/api/v2/user/avatar`
+                      : undefined
+                  }
+                  userName={api.userInfo$.name?.get()}
                 />
                 <div className="md:px-12">
                   <div className={messageClasses$.get()}>
