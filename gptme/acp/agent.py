@@ -7,6 +7,7 @@ as a coding agent from any ACP-compatible editor (Zed, JetBrains, etc.).
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import tempfile
 from pathlib import Path
@@ -219,11 +220,11 @@ class GptmeAgent:
                 options=[opt.to_dict() for opt in options],
             )
 
-            outcome = result.get("outcome", {})
-            if outcome.get("outcome") == "cancelled":
+            outcome = result.outcome
+            if outcome.outcome == "cancelled":
                 return False
 
-            option_id = outcome.get("optionId", "")
+            option_id = outcome.option_id
 
             # Cache always policies
             if option_id == "allow-always":
@@ -399,12 +400,19 @@ class GptmeAgent:
 
         # Initialize gptme on first connection
         if not self._initialized:
-            init(
-                model=self._model,
-                interactive=False,
-                tool_allowlist=None,
-                tool_format="markdown",
-            )
+            try:
+                init(
+                    model=self._model,
+                    interactive=False,
+                    tool_allowlist=None,
+                    tool_format="markdown",
+                )
+            except (KeyError, ValueError) as e:
+                logger.error(f"gptme initialization failed: {e}")
+                raise RuntimeError(
+                    f"gptme initialization failed: {e}. "
+                    "Ensure API keys are set in environment or config.toml."
+                ) from e
             self._initialized = True
 
         logger.info(f"ACP Initialize: protocol_version={protocol_version}")
@@ -497,7 +505,7 @@ class GptmeAgent:
         if not session:
             logger.error(f"Unknown session: {session_id}")
             assert PromptResponse is not None
-            return PromptResponse(stop_reason="error")
+            return PromptResponse(stop_reason="cancelled")
         # Update last_activity timestamp for cleanup tracking
         session.touch()
         log = session.log
@@ -531,7 +539,10 @@ class GptmeAgent:
                     )
                 )
 
-            response_msgs = await loop.run_in_executor(None, run_chat_step)
+            # Copy context to propagate ContextVars (model, config, tools, etc.)
+            # to the executor thread — run_in_executor doesn't do this by default
+            ctx = contextvars.copy_context()
+            response_msgs = await loop.run_in_executor(None, ctx.run, run_chat_step)
 
             # Phase 2: Mark all in-progress tool calls as completed
             await self._complete_pending_tool_calls(session_id)
@@ -567,7 +578,7 @@ class GptmeAgent:
                 source="gptme",
             )
             assert PromptResponse is not None
-            return PromptResponse(stop_reason="error")
+            return PromptResponse(stop_reason="cancelled")
 
     async def load_session(
         self,
@@ -598,6 +609,74 @@ class GptmeAgent:
         """
         # Phase 2: Implement cancellation
         logger.warning(f"cancel not yet implemented: {session_id}")
+
+    async def list_sessions(
+        self,
+        cursor: str | None = None,
+        cwd: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """List available sessions."""
+        if not _import_acp():
+            raise RuntimeError("agent-client-protocol package not installed")
+        from acp.client.connection import (  # type: ignore[import-not-found]
+            ListSessionsResponse,
+        )
+        from acp.schema import SessionInfo  # type: ignore[import-not-found]
+
+        sessions = self._registry.list_sessions()
+        return ListSessionsResponse(
+            sessions=[SessionInfo(session_id=sid, cwd="") for sid in sessions],
+        )
+
+    async def authenticate(
+        self,
+        method_id: str,
+        **kwargs: Any,
+    ) -> None:
+        """Handle authentication request (not supported)."""
+        logger.warning(f"authenticate not implemented: {method_id}")
+        return None
+
+    async def set_session_model(
+        self,
+        model_id: str,
+        session_id: str,
+        **kwargs: Any,
+    ) -> None:
+        """Set the model for a session."""
+        logger.info(f"set_session_model: session={session_id}, model={model_id}")
+        self._model = model_id
+        return None
+
+    async def set_session_mode(
+        self,
+        mode_id: str,
+        session_id: str,
+        **kwargs: Any,
+    ) -> None:
+        """Set the mode for a session (not supported)."""
+        logger.warning(
+            f"set_session_mode not implemented: session={session_id}, mode={mode_id}"
+        )
+        return None
+
+    async def ext_method(
+        self,
+        method: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Handle extension method calls."""
+        logger.warning(f"ext_method not implemented: {method}")
+        return {}
+
+    async def ext_notification(
+        self,
+        method: str,
+        params: dict[str, Any],
+    ) -> None:
+        """Handle extension notifications."""
+        logger.debug(f"ext_notification: {method}")
 
 
 def create_agent() -> GptmeAgent:

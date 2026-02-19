@@ -11,12 +11,19 @@ PROVIDER_DOCS: dict[str, str] = {
     "openai": "https://platform.openai.com/account/api-keys",
     "anthropic": "https://console.anthropic.com/settings/keys",
     "openrouter": "https://openrouter.ai/settings/keys",
-    "google": "https://aistudio.google.com/app/apikey",
+    "gemini": "https://aistudio.google.com/app/apikey",
+    "google": "https://aistudio.google.com/app/apikey",  # alias for gemini
     "groq": "https://console.groq.com/keys",
     "deepseek": "https://platform.deepseek.com/api_keys",
     "xai": "https://console.x.ai/",
+    "azure": "https://portal.azure.com/#view/Microsoft_Azure_ProjectOxford/CognitiveServicesHub",
+    "nvidia": "https://build.nvidia.com/",
     "local": "https://gptme.org/docs/providers.html#local-models",
+    "openai-subscription": "https://gptme.org/docs/providers.html#openai-subscription",
 }
+
+# Providers that use OAuth instead of API keys
+OAUTH_PROVIDERS: set[str] = {"openai-subscription"}
 
 
 def validate_api_key(

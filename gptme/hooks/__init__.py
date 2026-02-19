@@ -23,6 +23,11 @@ from .confirm import ConfirmationResult as ConfirmationResult
 from .confirm import ToolConfirmHook as ToolConfirmHook
 from .confirm import confirm as confirm
 from .confirm import get_confirmation as get_confirmation
+from .elicitation import ElicitationHook as ElicitationHook
+from .elicitation import ElicitationRequest as ElicitationRequest
+from .elicitation import ElicitationResponse as ElicitationResponse
+from .elicitation import FormField as FormField
+from .elicitation import elicit as elicit
 from .server_confirm import current_conversation_id as current_conversation_id
 from .server_confirm import current_session_id as current_session_id
 
@@ -109,6 +114,9 @@ class HookType(str, Enum):
 
     # Tool confirmation (different from other hooks - returns data, not yields Messages)
     TOOL_CONFIRM = "tool.confirm"  # Confirm tool execution before running
+
+    # Elicitation (agent requests structured input from user)
+    ELICIT = "elicit"  # Agent requests user input (text, choice, secret, form, etc.)
 
 
 # Protocol classes for different hook signatures
@@ -286,6 +294,7 @@ HookFunc = (
     | FilePostSaveHook
     | CacheInvalidatedHook
     | ToolConfirmHook
+    | ElicitationHook
 )
 
 
@@ -711,6 +720,16 @@ def register_hook(
 ) -> None: ...
 
 
+@overload
+def register_hook(
+    name: str,
+    hook_type: Literal[HookType.ELICIT],
+    func: ElicitationHook,
+    priority: int = 0,
+    enabled: bool = True,
+) -> None: ...
+
+
 # Implementation (catches all other cases)
 # Fallback overload for dynamic registration (when hook_type is not a Literal)
 @overload
@@ -860,6 +879,9 @@ def init_hooks(
         "server_confirm": lambda: __import__(
             "gptme.hooks.server_confirm", fromlist=["register"]
         ).register(),
+        "server_elicit": lambda: __import__(
+            "gptme.hooks.server_elicit", fromlist=["register"]
+        ).register(),
         # NOTE: subagent_completion is now registered via ToolSpec in tools/subagent.py
         "test": lambda: __import__(
             "gptme.hooks.test", fromlist=["register_test_hooks"]
@@ -873,15 +895,22 @@ def init_hooks(
         # Register all default hooks except test and mode-specific confirmation hooks
         # Confirmation hooks (cli_confirm, auto_confirm, server_confirm) should be
         # registered explicitly based on the mode (CLI, server, autonomous)
-        mode_specific_hooks = {"test", "cli_confirm", "auto_confirm", "server_confirm"}
+        mode_specific_hooks = {
+            "test",
+            "cli_confirm",
+            "auto_confirm",
+            "server_confirm",
+            "server_elicit",
+        }
         hooks_to_register = [h for h in available_hooks if h not in mode_specific_hooks]
 
-        # Mode-based confirmation hook selection:
-        # - Server mode with confirmation: server_confirm
+        # Mode-based hook selection:
+        # - Server mode with confirmation: server_confirm + server_elicit
         # - CLI interactive with confirmation enabled: cli_confirm
         # - Non-interactive (autonomous): no confirmation hook (auto-confirm behavior)
         if server and not no_confirm:
             hooks_to_register.append("server_confirm")
+            hooks_to_register.append("server_elicit")
         elif interactive and not no_confirm:
             hooks_to_register.append("cli_confirm")
 
