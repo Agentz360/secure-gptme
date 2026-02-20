@@ -231,6 +231,14 @@ ignore_missing_imports = true
 module = "flask.*"
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = "dspy.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "playwright.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -238,6 +246,8 @@ markers = [
     "serial",
     "timeout: marks tests with timeout value in seconds",
     "requires_api: marks tests that require API access",
+    "flaky: marks tests as flaky (retried automatically)",
+    "integration: marks tests as integration tests requiring external services",
 ]
 
 [tool.coverage.run]

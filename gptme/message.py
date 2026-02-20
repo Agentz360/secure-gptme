@@ -112,14 +112,12 @@ class Message:
         return f"<Message role={self.role} content={content}>"
 
     def __eq__(self, other):
-        # FIXME: really include timestamp?
         if not isinstance(other, Message):
             return False
-        return (
-            self.role == other.role
-            and self.content == other.content
-            and self.timestamp == other.timestamp
-        )
+        return self.role == other.role and self.content == other.content
+
+    def __hash__(self):
+        return hash((self.role, self.content))
 
     def len_tokens(self, model: str) -> int:
         return len_tokens(self, model=model)
@@ -258,7 +256,7 @@ timestamp = "{self.timestamp.isoformat()}"
 
         t = tomlkit.parse(toml)
         assert "message" in t and isinstance(t["message"], dict)
-        msg: dict = t["message"]  # type: ignore
+        msg: dict = t["message"]
 
         # Parse metadata if present
         metadata: MessageMetadata | None = None
@@ -435,7 +433,7 @@ def toml_to_msgs(toml: str) -> list[Message]:
     """
     t = tomlkit.parse(toml)
     assert "messages" in t and isinstance(t["messages"], list)
-    msgs: list[dict] = t["messages"]  # type: ignore
+    msgs: list[dict] = t["messages"]
 
     return [
         Message(

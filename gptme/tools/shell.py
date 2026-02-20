@@ -478,8 +478,8 @@ class ShellSession:
             universal_newlines=True,
             start_new_session=True,  # Create new process group for proper signal handling
         )
-        self.stdout_fd = self.process.stdout.fileno()  # type: ignore
-        self.stderr_fd = self.process.stderr.fileno()  # type: ignore
+        self.stdout_fd = self.process.stdout.fileno()  # type: ignore[union-attr]
+        self.stderr_fd = self.process.stderr.fileno()  # type: ignore[union-attr]
         self.delimiter = "END_OF_COMMAND_OUTPUT"
         self.start_marker = "START_OF_COMMAND_OUTPUT"
 
@@ -1682,7 +1682,10 @@ def _shorten_stdout(
     )
     will_truncate_by_tokens = False
     if pre_tokens is not None and post_tokens is not None:
-        tokenizer = get_tokenizer("gpt-4")
+        from ..llm.models import get_default_model  # fmt: skip
+
+        model = get_default_model()
+        tokenizer = get_tokenizer(model.model if model else "gpt-4")
         tokens = tokenizer.encode(stdout)
         will_truncate_by_tokens = len(tokens) > pre_tokens + post_tokens
 
@@ -1737,7 +1740,10 @@ def _shorten_stdout(
     assert (pre_tokens is None) == (post_tokens is None)
     if pre_tokens is not None and post_tokens is not None:
         if not will_truncate_by_tokens:
-            tokenizer = get_tokenizer("gpt-4")  # TODO: use sane default
+            from ..llm.models import get_default_model  # fmt: skip
+
+            model = get_default_model()
+            tokenizer = get_tokenizer(model.model if model else "gpt-4")
             tokens = tokenizer.encode(stdout)
         if len(tokens) > pre_tokens + post_tokens:
             truncation_msg = "... (output truncated"
