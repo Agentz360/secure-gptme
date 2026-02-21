@@ -34,9 +34,9 @@ def _complete_model(partial: str, _prev_args: list[str]) -> list[tuple[str, str]
                 desc = f"{model_count} models" if model_count else "dynamic"
                 completions.append((provider_prefix, desc))
 
-    # Get full model list (cached in get_model_list)
+    # Get full model list (cached in get_model_list), excluding deprecated
     try:
-        models = get_model_list(dynamic_fetch=True)
+        models = get_model_list(dynamic_fetch=True, include_deprecated=False)
         for model_meta in models:
             full_name = model_meta.full
             if full_name.startswith(partial):
@@ -77,7 +77,9 @@ def cmd_model(ctx: CommandContext) -> None:
         print(f"Set model to {new_model}")
     else:
         model = get_default_model()
-        assert model
+        if not model:
+            print("No model configured. Use `/model <model>` to set one.")
+            return
         print(f"Current model: {model.full}")
         print(
             f"  price: input ${model.price_input}/Mtok, output ${model.price_output}/Mtok"

@@ -371,10 +371,16 @@ def examples(tool_format):
 > Assistant: To list the files in the current directory, use `ls`:
 {ToolUse("shell", [], "ls").to_output(tool_format)}
 > System: Ran command: `ls`
-{ToolUse("shell", [], '''
+{
+        ToolUse(
+            "shell",
+            [],
+            '''
 file1.txt
 file2.txt
-'''.strip()).to_output()}
+'''.strip(),
+        ).to_output()
+    }
 
 #### The assistant can learn context by exploring the filesystem
 
@@ -382,10 +388,16 @@ file2.txt
 > Assistant: Lets start by checking the files
 {ToolUse("shell", [], "git ls-files").to_output(tool_format)}
 > System:
-{ToolUse("stdout", [], '''
+{
+        ToolUse(
+            "stdout",
+            [],
+            '''
 README.md
 main.py
-'''.strip()).to_output()}
+'''.strip(),
+        ).to_output()
+    }
 > Assistant: Now lets check the README
 {ToolUse("shell", [], "cat README.md").to_output(tool_format)}
 > System:
@@ -401,25 +413,40 @@ main.py
 
 > User: Create a new vue project with typescript and pinia named fancy-project
 > Assistant: Sure! Let's create a new vue project with TypeScript and Pinia named fancy-project:
-{ToolUse("shell",
-    [],
-    "npm init vue@latest fancy-project --yes -- --typescript --pinia"
-).to_output()}
+{
+        ToolUse(
+            "shell",
+            [],
+            "npm init vue@latest fancy-project --yes -- --typescript --pinia",
+        ).to_output()
+    }
 > System:
-{ToolUse("stdout", [], '''
+{
+        ToolUse(
+            "stdout",
+            [],
+            '''
 > npx
 > create-vue
 
 Vue.js - The Progressive JavaScript Framework
 
 Scaffolding project in ./fancy-project...
-'''.strip()).to_output()}
+'''.strip(),
+        ).to_output()
+    }
 
 #### Proper quoting for complex content
 
 > User: add a comment with backticks and special characters
 > Assistant: When passing complex content with special characters, use single quotes to prevent shell interpretation:
-{ToolUse("shell", [], "echo 'Content with `backticks` and $variables that should not be interpreted' > example.txt").to_output(tool_format)}
+{
+        ToolUse(
+            "shell",
+            [],
+            "echo 'Content with `backticks` and $variables that should not be interpreted' > example.txt",
+        ).to_output(tool_format)
+    }
 
 #### Background jobs for long-running commands
 
@@ -478,8 +505,10 @@ class ShellSession:
             universal_newlines=True,
             start_new_session=True,  # Create new process group for proper signal handling
         )
-        self.stdout_fd = self.process.stdout.fileno()  # type: ignore[union-attr]
-        self.stderr_fd = self.process.stderr.fileno()  # type: ignore[union-attr]
+        assert self.process.stdout is not None
+        assert self.process.stderr is not None
+        self.stdout_fd = self.process.stdout.fileno()
+        self.stderr_fd = self.process.stderr.fileno()
         self.delimiter = "END_OF_COMMAND_OUTPUT"
         self.start_marker = "START_OF_COMMAND_OUTPUT"
 
@@ -510,7 +539,108 @@ class ShellSession:
                 return res_code, res_stdout, res_stderr
         return res_code, res_stdout, res_stderr
 
+    def _needs_tty(self, command: str) -> bool:
+        """Check if a command needs a TTY (e.g. sudo password prompt) and we're interactive."""
+        if not sys.stdin.isatty():
+            return False
+        # Check for sudo without -S (stdin password) or -n (non-interactive)
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return False
+        # Find sudo in the command (may be preceded by env vars)
+        for i, part in enumerate(parts):
+            if "=" in part:
+                continue  # Skip env var assignments
+            if part == "sudo":
+                # Check if -S or -n flags are present (they disable TTY need)
+                # Also handle combined short flags like -Sn, -nS, -uS
+                remaining = parts[i + 1 :]
+                flags = [p for p in remaining if p.startswith("-")]
+                for flag in flags:
+                    if flag in ("--stdin", "--non-interactive"):
+                        return False
+                    # Check combined short flags (e.g. -Sn, -nS, -uS)
+                    if flag.startswith("-") and not flag.startswith("--"):
+                        chars = flag[1:]
+                        if "S" in chars or "n" in chars:
+                            return False
+                return True
+            break  # First non-env-var token is not sudo
+        return False
+
+    def _run_with_tty(
+        self, command: str, output: bool = True, timeout: float | None = None
+    ) -> tuple[int | None, str, str]:
+        """Run a command with /dev/tty as stdin for interactive password prompts (e.g. sudo).
+
+        Used for commands like sudo that need a real terminal to prompt for passwords.
+        Runs as a separate subprocess in the current working directory.
+        """
+        logger.debug(f"Shell: Running with TTY stdin: {command[:200]}")
+        try:
+            tty_stdin = open("/dev/tty", "rb")
+        except OSError:
+            logger.warning("Could not open /dev/tty, falling back to normal run")
+            return self._run_pipe(command, output=output, timeout=timeout)
+
+        # Inherit session env overrides so sudo commands behave consistently
+        # (e.g. no pager, consistent EDITOR) with commands run via _run_pipe
+        session_env = os.environ.copy()
+        session_env.update(
+            {
+                "PAGER": "",
+                "GH_PAGER": "",
+                "GIT_PAGER": "cat",
+                "EDITOR": "true",
+                "GIT_EDITOR": "true",
+                "VISUAL": "true",
+                "PYTHONUNBUFFERED": "1",
+            }
+        )
+        proc = subprocess.Popen(
+            ["bash", "-c", command],
+            stdin=tty_stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            # Don't use start_new_session=True here - we need to inherit the
+            # controlling terminal so sudo can prompt for passwords
+            cwd=os.getcwd(),
+            env=session_env,
+        )
+        try:
+            stdout_data, stderr_data = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout_data, stderr_data = proc.communicate()
+            stdout_str = stdout_data.decode("utf-8", errors="replace").strip()
+            stderr_str = stderr_data.decode("utf-8", errors="replace").strip()
+            return -124, stdout_str, stderr_str
+        except KeyboardInterrupt:
+            proc.kill()
+            proc.communicate()
+            raise
+        finally:
+            tty_stdin.close()
+
+        stdout_str = stdout_data.decode("utf-8", errors="replace").strip()
+        stderr_str = stderr_data.decode("utf-8", errors="replace").strip()
+        if output:
+            if stdout_str:
+                print(stdout_str, file=sys.stdout)
+            if stderr_str:
+                print(stderr_str, file=sys.stderr)
+        return proc.returncode, stdout_str, stderr_str
+
     def _run(
+        self, command: str, output=True, tries=0, timeout: float | None = None
+    ) -> tuple[int | None, str, str]:
+        # Use TTY-based execution for interactive sudo commands
+        if self._needs_tty(command):
+            return self._run_with_tty(command, output=output, timeout=timeout)
+        return self._run_pipe(command, output=output, tries=tries, timeout=timeout)
+
+    def _run_pipe(
         self, command: str, output=True, tries=0, timeout: float | None = None
     ) -> tuple[int | None, str, str]:
         assert self.process.stdin
@@ -580,11 +710,10 @@ class ShellSession:
                 # log warning and restart, once
                 logger.warning("Warning: shell process died, restarting")
                 self.restart()
-                return self._run(
+                return self._run_pipe(
                     command, output=output, tries=tries + 1, timeout=timeout
                 )
-            else:
-                raise
+            raise
 
         self.process.stdin.flush()
 
@@ -680,8 +809,12 @@ class ShellSession:
                             # if command is cd and successful, we need to change the directory
                             if command.startswith("cd ") and return_code == 0:
                                 ex, pwd, _ = self._run("pwd", output=False)
-                                assert ex == 0
-                                os.chdir(pwd.strip())
+                                if ex != 0:
+                                    logger.warning(
+                                        "pwd failed after cd, cannot update working directory"
+                                    )
+                                else:
+                                    os.chdir(pwd.strip())
 
                             # Issue #408: Drain any remaining stderr before returning
                             # This prevents stderr from leaking to the next command
@@ -916,10 +1049,7 @@ def is_allowlisted(cmd: str) -> bool:
     # Check for file redirections (>, >>)
     # File redirections with allowlisted commands can be used to write malicious content
     # Example: echo "malicious_code" > /tmp/exploit.sh
-    if _has_file_redirection(cmd):
-        return False
-
-    return True
+    return not _has_file_redirection(cmd)
 
 
 def shell_allowlist_hook(
@@ -1046,10 +1176,7 @@ def _find_heredoc_regions(cmd: str) -> list[tuple[int, int]]:
 
 def _is_in_quoted_region(pos: int, quoted_regions: list[tuple[int, int]]) -> bool:
     """Check if a position is within any quoted region."""
-    for start, end in quoted_regions:
-        if start <= pos < end:
-            return True
-    return False
+    return any(start <= pos < end for start, end in quoted_regions)
 
 
 def _find_first_unquoted_pipe(command: str) -> int | None:
@@ -1464,10 +1591,9 @@ def check_with_shellcheck(cmd: str) -> tuple[bool, bool, str]:
                 codes_str = ", ".join(sorted(blocking_codes))
                 message = f"Shellcheck found critical issues that prevent execution:\n```\n{output}```\n\nBlocking codes: {codes_str}"
                 return True, True, message
-            else:
-                # Non-critical warnings
-                message = f"Shellcheck found potential issues:\n```\n{output}```"
-                return True, False, message
+            # Non-critical warnings
+            message = f"Shellcheck found potential issues:\n```\n{output}```"
+            return True, False, message
 
         return False, False, ""
     except (subprocess.TimeoutExpired, Exception):
@@ -1785,8 +1911,6 @@ def _find_max_heredoc_pos(node, current_max: int = 0) -> int:
 
 
 def split_commands(script: str) -> list[str]:
-    # TODO: write proper tests
-
     # Preprocess script to handle quoted heredoc delimiters that bashlex can't parse
     processed_script = _preprocess_quoted_heredocs(script)
 

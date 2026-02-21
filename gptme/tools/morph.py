@@ -42,8 +42,11 @@ DO NOT omit spans of pre-existing code without using the // ... existing code ..
 
 
 def examples(tool_format) -> str:
-    return f"""{ToolUse("morph", ["example.py"],
-'''
+    return f"""{
+        ToolUse(
+            "morph",
+            ["example.py"],
+            '''
 // ... existing code ...
 FIRST_EDIT
 // ... existing code ...
@@ -51,7 +54,9 @@ SECOND_EDIT
 // ... existing code ...
 THIRD_EDIT
 // ... existing code ...
-'''.strip()).to_output(tool_format)}"""
+'''.strip(),
+        ).to_output(tool_format)
+    }"""
 
 
 def is_openrouter_available() -> bool:
@@ -87,7 +92,7 @@ def preview_morph(content: str, path: Path | None) -> str | None:
         return "\n".join(diff_lines)
 
     except Exception as e:
-        return f"Preview failed: {str(e)}"
+        return f"Preview failed: {e}"
 
 
 def execute_morph(
@@ -132,7 +137,7 @@ def execute_morph(
             messages, "openrouter/morph/morph-v3-fast", tools=None
         )
     except Exception as e:
-        yield Message("system", f"Error: failed Morph API call: {str(e)}")
+        yield Message("system", f"Error: failed Morph API call: {e}")
         return
 
     edited_content = response.strip()
@@ -230,7 +235,7 @@ def execute_morph_impl(
             f"Morph failed: Permission denied when writing to `{path}`"
         ) from None
     except Exception as e:
-        raise ValueError(f"Morph failed: {str(e)}") from e
+        raise ValueError(f"Morph failed: {e}") from e
 
 
 tool = ToolSpec(

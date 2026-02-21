@@ -42,10 +42,9 @@ def _mock_permission_response(option_id: str | None = None, cancelled: bool = Fa
 
         if cancelled:
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
-        else:
-            return RequestPermissionResponse(
-                outcome=AllowedOutcome(outcome="selected", option_id=option_id or "")
-            )
+        return RequestPermissionResponse(
+            outcome=AllowedOutcome(outcome="selected", option_id=option_id or "")
+        )
     except ImportError:
         pytest.skip("acp not installed")
 
@@ -66,6 +65,10 @@ class TestGptmeAgentInit:
         mock_conn = MagicMock()
         agent.on_connect(mock_conn)
         assert agent._conn is mock_conn
+
+    def test_create_has_session_models_dict(self):
+        agent = GptmeAgent()
+        assert agent._session_models == {}
 
     def test_create_agent_factory(self):
         from gptme.acp.agent import create_agent
@@ -491,3 +494,141 @@ class TestInitializeWithoutAcp:
         agent = GptmeAgent()
         with pytest.raises(NotImplementedError, match="not yet implemented"):
             _run(agent.load_session(session_id="fake_session"))
+
+
+class TestCleanupSession:
+    """Tests for _cleanup_session and cancel methods."""
+
+    def test_cleanup_removes_all_state(self):
+        """_cleanup_session should remove session_models, tool_calls, and permission_policies."""
+        agent = GptmeAgent()
+        sid = "session_cleanup_test"
+
+        # Populate all per-session state
+        agent._session_models[sid] = "anthropic/claude-sonnet-4-6"
+        agent._tool_calls[sid] = {
+            "call_1": ToolCall(
+                tool_call_id="call_1", title="Test", kind=ToolKind.EXECUTE
+            )
+        }
+        agent._permission_policies[sid] = {"execute": "allow"}
+        agent._registry.create(sid)
+
+        agent._cleanup_session(sid)
+
+        assert sid not in agent._session_models
+        assert sid not in agent._tool_calls
+        assert sid not in agent._permission_policies
+        assert agent._registry.get(sid) is None
+
+    def test_cleanup_idempotent_on_unknown_session(self):
+        """Cleaning up a nonexistent session should not raise."""
+        agent = GptmeAgent()
+        # Should not raise
+        agent._cleanup_session("nonexistent_session")
+
+    def test_cleanup_isolates_other_sessions(self):
+        """Cleaning up one session should not affect another."""
+        agent = GptmeAgent()
+
+        agent._session_models["s1"] = "model-a"
+        agent._session_models["s2"] = "model-b"
+        agent._tool_calls["s1"] = {}
+        agent._tool_calls["s2"] = {}
+
+        agent._cleanup_session("s1")
+
+        assert "s1" not in agent._session_models
+        assert agent._session_models["s2"] == "model-b"
+        assert "s1" not in agent._tool_calls
+        assert "s2" in agent._tool_calls
+
+    def test_cancel_calls_cleanup(self):
+        """cancel() should clean up all per-session state."""
+        agent = GptmeAgent()
+        sid = "session_cancel_test"
+
+        agent._session_models[sid] = "some-model"
+        agent._tool_calls[sid] = {}
+        agent._permission_policies[sid] = {"execute": "allow"}
+
+        _run(agent.cancel(session_id=sid))
+
+        assert sid not in agent._session_models
+        assert sid not in agent._tool_calls
+        assert sid not in agent._permission_policies
+
+
+class TestPerSessionModel:
+    """Tests for per-session model override behavior.
+
+    Validates that _session_models is correctly populated and used
+    when resolving the effective model for a session.
+    """
+
+    def test_set_session_model_stores_model(self):
+        """set_session_model should store model in _session_models dict."""
+        agent = GptmeAgent()
+        _run(
+            agent.set_session_model(
+                model_id="openrouter/meta-llama/llama-3", session_id="s1"
+            )
+        )
+        assert agent._session_models["s1"] == "openrouter/meta-llama/llama-3"
+
+    def test_set_session_model_overwrites_existing(self):
+        """Calling set_session_model twice should overwrite the previous value."""
+        agent = GptmeAgent()
+        agent._session_models["s1"] = "old-model"
+        _run(agent.set_session_model(model_id="new-model", session_id="s1"))
+        assert agent._session_models["s1"] == "new-model"
+
+    def test_set_session_model_isolates_sessions(self):
+        """Setting model for one session should not affect another."""
+        agent = GptmeAgent()
+        _run(agent.set_session_model(model_id="model-a", session_id="s1"))
+        _run(agent.set_session_model(model_id="model-b", session_id="s2"))
+        assert agent._session_models["s1"] == "model-a"
+        assert agent._session_models["s2"] == "model-b"
+
+    def test_effective_model_uses_per_session_override(self):
+        """When session has a per-session model, it should be used over the global default."""
+        agent = GptmeAgent()
+        agent._model = "global-default"
+        agent._session_models["s1"] = "per-session-override"
+
+        effective = agent._session_models.get("s1", agent._model)
+        assert effective == "per-session-override"
+
+    def test_effective_model_falls_back_to_global(self):
+        """When no per-session model is set, the global model should be used."""
+        agent = GptmeAgent()
+        agent._model = "global-default"
+
+        effective = agent._session_models.get("unknown-session", agent._model)
+        assert effective == "global-default"
+
+    def test_effective_model_none_when_both_unset(self):
+        """When neither per-session nor global model is set, effective should be None."""
+        agent = GptmeAgent()
+
+        effective = agent._session_models.get("unknown-session", agent._model)
+        assert effective is None
+
+    def test_cleanup_removes_session_model(self):
+        """_cleanup_session should remove the per-session model."""
+        agent = GptmeAgent()
+        agent._session_models["s1"] = "some-model"
+        agent._session_models["s2"] = "other-model"
+
+        agent._cleanup_session("s1")
+
+        assert "s1" not in agent._session_models
+        assert agent._session_models["s2"] == "other-model"
+
+    def test_per_session_model_with_provider_suffix(self):
+        """Per-session models with @provider routing syntax should be stored as-is."""
+        agent = GptmeAgent()
+        model_with_routing = "z-ai/glm-5@together"
+        _run(agent.set_session_model(model_id=model_with_routing, session_id="s1"))
+        assert agent._session_models["s1"] == model_with_routing

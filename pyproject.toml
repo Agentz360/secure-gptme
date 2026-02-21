@@ -7,6 +7,7 @@ authors = [
 ]
 readme = "README.md"
 license = "MIT"
+requires-python = ">=3.10"
 dynamic = ["dependencies"]  # "version"
 
 [project.urls]
@@ -47,7 +48,7 @@ tomlkit = "*"
 typing-extensions = "*"
 platformdirs = "^4.3"
 lxml = "*"
-pypdf = "^5.1.0"  # For PDF text extraction in browser tool
+pypdf = ">=5.1.0"  # For PDF text extraction in browser tool
 requests = "^2.32"  # For HTTP requests in browser tool (PDF detection)
 json-repair = "^0.32.0"
 mcp = "^1.13.0"
@@ -194,7 +195,7 @@ target-version = "py310"
 # Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`)  codes by default.
 # Unlike Flake8, Ruff doesn't enable pycodestyle warnings (`W`) or
 # McCabe complexity (`C901`) by default.
-select = ["E4", "E7", "E9", "F", "B", "UP", "I"]
+select = ["E4", "E7", "E9", "F", "B", "UP", "I", "SIM103", "SIM110", "SIM117", "SIM118", "SIM300", "SIM910", "PIE790", "RET501", "RET505"]
 ignore = ["E402", "E501", "B905"]
 #fixable = ["ALL"]
 #unfixable = ["B"]
@@ -233,6 +234,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "dspy.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "chromadb.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

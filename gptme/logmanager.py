@@ -1,4 +1,3 @@
-import fcntl
 import json
 import logging
 import os
@@ -111,7 +110,7 @@ class LogManager:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         """Exit context manager, ensuring lock is released."""
         self._release_lock()
-        return None
+        return
 
     def __init__(
         self,
@@ -143,7 +142,7 @@ class LogManager:
         # Create and optionally lock the directory
         self.logdir.mkdir(parents=True, exist_ok=True)
         is_pytest = "PYTEST_CURRENT_TEST" in os.environ
-        if lock and not is_pytest:
+        if lock and not is_pytest and os.name != "nt":
             self._lockfile = self.logdir / ".lock"
             self._lockfile.touch(exist_ok=True)
             self._lock_fd = self._lockfile.open("r+")
@@ -189,6 +188,7 @@ class LogManager:
         - PID tracking for debugging
         """
         import atexit
+        import fcntl
 
         assert self._lock_fd is not None, "_acquire_lock called without open fd"
 
@@ -259,6 +259,8 @@ class LogManager:
     def _release_lock(self):
         """Release the lock and close the file descriptor"""
         if self._lock_fd:
+            import fcntl
+
             try:
                 fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
                 self._lock_fd.close()
@@ -394,7 +396,7 @@ class LogManager:
     def _save_backup_branch(self, type="edit") -> None:
         """backup the current log to a new branch, usually before editing/undoing"""
         branch_prefix = f"{self.current_branch}-{type}-"
-        n = len([b for b in self._branches.keys() if b.startswith(branch_prefix)])
+        n = len([b for b in self._branches if b.startswith(branch_prefix)])
         self._branches[f"{branch_prefix}{n}"] = self.log
         self.write()
 
@@ -416,8 +418,6 @@ class LogManager:
         if self.log and not self.log[-1].content.startswith("/"):
             self._save_backup_branch(type="undo")
 
-        # Doesn't work for multiple undos in a row, but useful in testing
-        # assert undid.content == ".undo"  # assert that the last message is an undo
         peek = self.log[-1] if self.log else None
         if not peek:
             print("[yellow]Nothing to undo.[/]")
@@ -506,8 +506,7 @@ class LogManager:
 
         if diff:
             return "\n".join(diff)
-        else:
-            return None
+        return None
 
     # ==================== View Branch Methods ====================
     # Views are compacted versions of the conversation stored separately.
@@ -555,7 +554,7 @@ class LogManager:
         """Generate the next sequential view name."""
         existing = [
             int(v.split("-")[1])
-            for v in self._views.keys()
+            for v in self._views
             if v.startswith("compacted-") and v.split("-")[1].isdigit()
         ]
         next_num = max(existing, default=0) + 1
@@ -616,7 +615,7 @@ def prepare_messages(
     if (len_from := len_tokens(msgs, model.model)) != (
         len_to := len_tokens(msgs_reduced, model.model)
     ):
-        logger.info(f"Reduced log from {len_from//1} to {len_to//1} tokens")
+        logger.info(f"Reduced log from {len_from // 1} to {len_to // 1} tokens")
     msgs_limited = limit_log(msgs_reduced)
     if len(msgs_reduced) != len(msgs_limited):
         logger.info(
@@ -770,26 +769,32 @@ def delete_conversation(conv_id: str) -> bool:
 
 
 def check_for_modifications(log: Log) -> bool:
-    """Check if there are any file modifications in assistant messages since last user message."""
-    messages_since_user = []
-    found_user_message = False
+    """Check if the most recent assistant message (since last user) has file modifications.
+
+    Only checks the last assistant message to prevent re-triggering pre-commit/autocommit
+    when the agent responds to hook output (e.g. pre-commit failure) without making new
+    file changes. Checking all assistant messages since the last user would cause infinite
+    loops: the original save is still visible after the agent writes a text response to
+    the failure.
+    """
+    last_assistant: Message | None = None
+    found_user = False
 
     for m in reversed(log):
         if m.role == "user":
-            found_user_message = True
+            found_user = True
             break
         if m.role == "system":
-            continue
-        messages_since_user.append(m)
+            continue  # Skip system messages (tool results, hook outputs)
+        if last_assistant is None:
+            last_assistant = m  # Record only the most recent assistant message
 
-    # If no user message found, skip the check (only system messages so far)
-    if not found_user_message:
+    if not found_user or last_assistant is None:
         return False
 
     return any(
         tu.tool in ["save", "patch", "append", "morph"]
-        for m in messages_since_user
-        for tu in ToolUse.iter_from_content(m.content)
+        for tu in ToolUse.iter_from_content(last_assistant.content)
     )
 
 
@@ -798,7 +803,14 @@ def _gen_read_jsonl(path: PathLike) -> Generator[Message, None, None]:
 
     with open(path) as file:
         for line in file.readlines():
-            json_data = json.loads(line)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                json_data = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning(f"Skipping malformed JSON line in {path}")
+                continue
             files = [parse_file_reference(f) for f in json_data.pop("files", [])]
             file_hashes = json_data.pop("file_hashes", {})
             if "timestamp" in json_data:

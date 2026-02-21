@@ -33,7 +33,6 @@ def main(verbose: bool = False):
 @main.group()
 def providers():
     """Commands for managing custom providers."""
-    pass
 
 
 @providers.command("list")
@@ -78,7 +77,6 @@ def providers_list():
 @main.group()
 def mcp():
     """Commands for managing MCP servers."""
-    pass
 
 
 @mcp.command("list")
@@ -123,7 +121,7 @@ def mcp_list():
                 )
                 click.echo(f"   Tools: {', '.join(tool_names)}{more}")
         except Exception as e:
-            click.echo(f"   Status: ❌ Connection failed: {str(e)}")
+            click.echo(f"   Status: ❌ Connection failed: {e}")
 
         click.echo()
 
@@ -161,7 +159,7 @@ def mcp_test(server_name: str):
             click.echo(f"   • {tool.name}: {tool.description or 'No description'}")
 
     except Exception as e:
-        click.echo(f"❌ Connection failed: {str(e)}")
+        click.echo(f"❌ Connection failed: {e}")
 
 
 @mcp.command("info")
@@ -333,7 +331,6 @@ def chats_read(id: str):
 @main.group()
 def tokens():
     """Commands for token counting."""
-    pass
 
 
 @tokens.command("count")
@@ -372,7 +369,6 @@ def tokens_count(text: str | None, model: str, file: str | None):
 @main.group()
 def context():
     """Commands for context generation."""
-    pass
 
 
 @context.command("index")
@@ -419,7 +415,6 @@ def context_retrieve(query: str, full: bool):
 @main.group()
 def llm():
     """LLM-related utilities."""
-    pass
 
 
 @llm.command("generate")
@@ -511,7 +506,6 @@ def llm_generate(prompt: str | None, model: str | None, stream: bool):
 @main.group()
 def skills():
     """Browse and inspect skills and lessons."""
-    pass
 
 
 @skills.command("list")
@@ -679,7 +673,6 @@ def skills_dirs():
 @main.group()
 def tools():
     """Tool-related utilities."""
-    pass
 
 
 @tools.command("list")
@@ -792,7 +785,6 @@ def tools_call(tool_name: str, function_name: str, arg: list[str]):
 @main.group()
 def prompts():
     """Commands for prompt utilities."""
-    pass
 
 
 @prompts.command("expand")
@@ -818,7 +810,6 @@ def prompts_expand(prompt: tuple[str, ...]):
 @main.group()
 def models():
     """Model-related utilities."""
-    pass
 
 
 @models.command("list")
@@ -831,8 +822,18 @@ def models():
 @click.option(
     "--simple", is_flag=True, help="Output one model per line as provider/model"
 )
+@click.option(
+    "--include-deprecated",
+    is_flag=True,
+    help="Include deprecated/sunset models in the listing",
+)
 def models_list(
-    provider: str | None, pricing: bool, vision: bool, reasoning: bool, simple: bool
+    provider: str | None,
+    pricing: bool,
+    vision: bool,
+    reasoning: bool,
+    simple: bool,
+    include_deprecated: bool,
 ):
     """List available models."""
 
@@ -841,6 +842,7 @@ def models_list(
         show_pricing=pricing,
         vision_only=vision,
         reasoning_only=reasoning,
+        include_deprecated=include_deprecated,
         simple_format=simple,
         dynamic_fetch=True,
     )
@@ -875,6 +877,9 @@ def models_info(model_name: str):
 
     if model.knowledge_cutoff:
         print(f"Knowledge cutoff: {model.knowledge_cutoff.strftime('%Y-%m-%d')}")
+
+    if model.deprecated:
+        print("Status: DEPRECATED")
 
 
 if __name__ == "__main__":

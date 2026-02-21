@@ -4,7 +4,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from typing import (
-    TYPE_CHECKING,
     Literal,
     TypedDict,
     cast,
@@ -15,13 +14,20 @@ from typing_extensions import NotRequired
 
 from .llm_openai_models import OPENAI_MODELS
 
-if TYPE_CHECKING:
-    pass
-
 logger = logging.getLogger(__name__)
 
 # Pattern to match date suffixes like -20250929 or -20250514
 _DATE_SUFFIX_PATTERN = re.compile(r"-\d{8}$")
+
+# Model aliases: maps short alias names to their canonical model IDs per provider.
+# Avoids duplicating full metadata entries for models with both short and dated names.
+MODEL_ALIASES: dict[str, dict[str, str]] = {
+    "anthropic": {
+        "claude-opus-4-1": "claude-opus-4-1-20250805",
+        "claude-opus-4-0": "claude-opus-4-20250514",
+        "claude-sonnet-4-0": "claude-sonnet-4-20250514",
+    },
+}
 
 # Built-in providers (static list)
 BuiltinProvider = Literal[
@@ -48,8 +54,6 @@ class CustomProvider(str):
     Subclasses str so it can be used anywhere a provider string is expected,
     but is distinguishable from plain strings and built-in Provider literals.
     """
-
-    pass
 
 
 def is_custom_provider(provider: str) -> bool:
@@ -94,6 +98,9 @@ class ModelMeta:
 
     knowledge_cutoff: datetime | None = None
 
+    # whether the model is deprecated/sunset by the provider
+    deprecated: bool = False
+
     @property
     def full(self) -> str:
         # For unknown providers (including custom providers), the model field
@@ -116,6 +123,7 @@ class _ModelDictMeta(TypedDict):
     supports_reasoning: NotRequired[bool]
 
     knowledge_cutoff: NotRequired[datetime]
+    deprecated: NotRequired[bool]
 
 
 # default model - using ContextVar for thread safety
@@ -141,6 +149,8 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "supports_reasoning": True,
         }
         for model in [
+            "gpt-5.3-codex",
+            "gpt-5.3-codex-spark",
             "gpt-5.2",
             "gpt-5.2-codex",
             "gpt-5.1-codex-max",
@@ -241,6 +251,15 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "supports_reasoning": True,
             "knowledge_cutoff": datetime(2024, 10, 1),
         },
+        "claude-3-7-sonnet-latest": {
+            "context": 200_000,
+            "max_output": 8192,
+            "price_input": 3,
+            "price_output": 15,
+            "supports_vision": True,
+            "supports_reasoning": True,
+            "knowledge_cutoff": datetime(2024, 10, 1),
+        },
         "claude-3-5-sonnet-20241022": {
             "context": 200_000,
             "max_output": 8192,
@@ -254,9 +273,27 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "max_output": 4096,
             "price_input": 3,
             "price_output": 15,
+            "supports_vision": True,
+            "knowledge_cutoff": datetime(2024, 4, 1),
+            "deprecated": True,  # superseded by claude-3-5-sonnet-20241022
+        },
+        "claude-3-5-sonnet-latest": {
+            "context": 200_000,
+            "max_output": 8192,
+            "price_input": 3,
+            "price_output": 15,
+            "supports_vision": True,
             "knowledge_cutoff": datetime(2024, 4, 1),
         },
         "claude-3-5-haiku-20241022": {
+            "context": 200_000,
+            "max_output": 8192,
+            "price_input": 1,
+            "price_output": 5,
+            "supports_vision": True,
+            "knowledge_cutoff": datetime(2024, 4, 1),
+        },
+        "claude-3-5-haiku-latest": {
             "context": 200_000,
             "max_output": 8192,
             "price_input": 1,
@@ -269,14 +306,27 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "max_output": 4096,
             "price_input": 0.25,
             "price_output": 1.25,
+            "supports_vision": True,
             "knowledge_cutoff": datetime(2024, 4, 1),
+            "deprecated": True,  # superseded by claude-3-5-haiku
         },
         "claude-3-opus-20240229": {
             "context": 200_000,
             "max_output": 4096,
             "price_input": 15,
             "price_output": 75,
+            "supports_vision": True,
             "knowledge_cutoff": datetime(2023, 8, 1),
+            "deprecated": True,  # superseded by claude-opus-4+
+        },
+        "claude-3-opus-latest": {
+            "context": 200_000,
+            "max_output": 4096,
+            "price_input": 15,
+            "price_output": 75,
+            "supports_vision": True,
+            "knowledge_cutoff": datetime(2023, 8, 1),
+            "deprecated": True,  # resolves to claude-3-opus-20240229 (deprecated)
         },
     },
     # https://ai.google.dev/gemini-api/docs/models
@@ -580,11 +630,11 @@ def _find_base_model_properties(
 ) -> "_ModelDictMeta | None":
     """Find properties from a base model when model_name might be a variant.
 
-    Handles models with date suffixes like claude-sonnet-4-5-20250929 by looking up
-    the base model (claude-sonnet-4-5) and returning its properties.
+    Handles model aliases (e.g., claude-opus-4-1 -> claude-opus-4-1-20250805)
+    and date suffixes (e.g., claude-sonnet-4-5-20250929 -> claude-sonnet-4-5).
 
     Note: This function is called after verifying the exact model name doesn't exist
-    in MODELS[provider], so we only need to check for base model variants.
+    in MODELS[provider], so we only need to check for variants and aliases.
 
     Returns:
         Model properties dict if base model found, None otherwise.
@@ -593,6 +643,13 @@ def _find_base_model_properties(
         return None
 
     provider_models = MODELS[provider]
+
+    # Try alias resolution (e.g., claude-opus-4-1 -> claude-opus-4-1-20250805)
+    if provider in MODEL_ALIASES and model_name in MODEL_ALIASES[provider]:
+        canonical = MODEL_ALIASES[provider][model_name]
+        if canonical in provider_models:
+            logger.info(f"Resolved alias {model_name} -> {canonical}")
+            return provider_models[canonical]
 
     # Try stripping date suffix (e.g., -20250929) to find base model
     base_name = _DATE_SUFFIX_PATTERN.sub("", model_name)
@@ -615,10 +672,7 @@ def get_model(model: str) -> ModelMeta:
     if custom_provider:
         if custom_provider.default_model:
             return get_model(f"{model}/{custom_provider.default_model}")
-        else:
-            raise ValueError(
-                f"Custom provider '{model}' has no default_model configured"
-            )
+        raise ValueError(f"Custom provider '{model}' has no default_model configured")
 
     # Check if model starts with a custom provider prefix
     if "/" in model:
@@ -713,60 +767,54 @@ def get_model(model: str) -> ModelMeta:
                     context=200_000,
                     supports_reasoning=True,
                 )
-            else:
-                # Generic fallback for other providers
-                return ModelMeta(provider, model_name, context=128_000)
-        else:
-            # Unknown provider
-            logger.warning(f"Unknown model {model}, using fallback metadata")
-            return ModelMeta(provider="unknown", model=model, context=128_000)
-    else:
-        # try to find model in all providers, starting with static models
-        for provider in cast(list[Provider], MODELS.keys()):
-            if model in MODELS[provider]:
-                return ModelMeta(provider, model, **MODELS[provider][model])
-
-        # For model name without provider, also try dynamic fetching for openrouter
-        try:
-            openrouter_models = _get_models_for_provider(
-                "openrouter", dynamic_fetch=True
-            )
-            # Strip @ suffix for comparison (e.g., "z-ai/glm-5@z-ai" -> "z-ai/glm-5")
-            base_model = model.split("@")[0] if "@" in model else model
-            for model_meta in openrouter_models:
-                if model_meta.model == model or model_meta.model == base_model:
-                    return ModelMeta(
-                        provider=model_meta.provider,
-                        model=model,  # Preserve original name with suffix
-                        context=model_meta.context,
-                        max_output=model_meta.max_output,
-                        supports_streaming=model_meta.supports_streaming,
-                        supports_vision=model_meta.supports_vision,
-                        supports_reasoning=model_meta.supports_reasoning,
-                        price_input=model_meta.price_input,
-                        price_output=model_meta.price_output,
-                        knowledge_cutoff=model_meta.knowledge_cutoff,
-                    )
-        except Exception as e:
-            logger.debug("Failed to fetch OpenRouter models for %s: %s", model, e)
-
+            # Generic fallback for other providers
+            return ModelMeta(provider, model_name, context=128_000)
+        # Unknown provider
         logger.warning(f"Unknown model {model}, using fallback metadata")
         return ModelMeta(provider="unknown", model=model, context=128_000)
+    # try to find model in all providers, starting with static models
+    for provider in cast(list[Provider], MODELS.keys()):
+        if model in MODELS[provider]:
+            return ModelMeta(provider, model, **MODELS[provider][model])
+
+    # For model name without provider, also try dynamic fetching for openrouter
+    try:
+        openrouter_models = _get_models_for_provider("openrouter", dynamic_fetch=True)
+        # Strip @ suffix for comparison (e.g., "z-ai/glm-5@z-ai" -> "z-ai/glm-5")
+        base_model = model.split("@")[0] if "@" in model else model
+        for model_meta in openrouter_models:
+            if model_meta.model == model or model_meta.model == base_model:
+                return ModelMeta(
+                    provider=model_meta.provider,
+                    model=model,  # Preserve original name with suffix
+                    context=model_meta.context,
+                    max_output=model_meta.max_output,
+                    supports_streaming=model_meta.supports_streaming,
+                    supports_vision=model_meta.supports_vision,
+                    supports_reasoning=model_meta.supports_reasoning,
+                    price_input=model_meta.price_input,
+                    price_output=model_meta.price_output,
+                    knowledge_cutoff=model_meta.knowledge_cutoff,
+                )
+    except Exception as e:
+        logger.debug("Failed to fetch OpenRouter models for %s: %s", model, e)
+
+    logger.warning(f"Unknown model {model}, using fallback metadata")
+    return ModelMeta(provider="unknown", model=model, context=128_000)
 
 
 def get_recommended_model(provider: Provider) -> str:  # pragma: no cover
     if provider == "openai":
         return "gpt-5"
-    elif provider == "openrouter":
+    if provider == "openrouter":
         return "meta-llama/llama-3.1-405b-instruct"
-    elif provider == "gemini":
+    if provider == "gemini":
         return "gemini-2.5-pro"
-    elif provider == "anthropic":
+    if provider == "anthropic":
         return "claude-sonnet-4-6"
-    elif provider == "xai":
+    if provider == "xai":
         return "grok-4"
-    else:
-        raise ValueError(f"Provider {provider} did not have a recommended model")
+    raise ValueError(f"Provider {provider} did not have a recommended model")
 
 
 def get_summary_model(provider: Provider) -> str | None:  # pragma: no cover
@@ -777,23 +825,22 @@ def get_summary_model(provider: Provider) -> str | None:  # pragma: no cover
     """
     if provider == "openai":
         return "gpt-5-mini"
-    elif provider == "openrouter":
+    if provider == "openrouter":
         return "meta-llama/llama-3.1-8b-instruct"
-    elif provider == "gemini":
+    if provider == "gemini":
         return "gemini-2.5-flash"
-    elif provider == "anthropic":
+    if provider == "anthropic":
         return "claude-haiku-4-5"
-    elif provider == "deepseek":
+    if provider == "deepseek":
         return "deepseek-chat"
-    elif provider == "xai":
+    if provider == "xai":
         return "grok-4-1-fast"
-    elif provider == "local":
+    if provider == "local":
         # Local providers don't have predefined summary models
         # Return None to signal "use the same model"
         return None
-    else:
-        # Unknown providers - return None rather than raising
-        return None
+    # Unknown providers - return None rather than raising
+    return None
 
 
 def _get_models_for_provider(
@@ -836,11 +883,16 @@ def _get_models_for_provider(
 
 
 def _apply_model_filters(
-    models: list[ModelMeta], vision_only: bool = False, reasoning_only: bool = False
+    models: list[ModelMeta],
+    vision_only: bool = False,
+    reasoning_only: bool = False,
+    include_deprecated: bool = False,
 ) -> list[ModelMeta]:
-    """Apply vision and reasoning filters to models."""
+    """Apply vision, reasoning, and deprecation filters to models."""
     filtered_models = []
     for model in models:
+        if not include_deprecated and model.deprecated:
+            continue
         if vision_only and not model.supports_vision:
             continue
         if reasoning_only and not model.supports_reasoning:
@@ -859,6 +911,7 @@ def get_model_list(
     provider_filter: str | None = None,
     vision_only: bool = False,
     reasoning_only: bool = False,
+    include_deprecated: bool = False,
     dynamic_fetch: bool = True,
 ) -> list[ModelMeta]:
     """
@@ -871,6 +924,7 @@ def get_model_list(
         provider_filter: Only include models from this provider
         vision_only: Only include models with vision support
         reasoning_only: Only include models with reasoning support
+        include_deprecated: Include deprecated/sunset models (default: False)
         dynamic_fetch: Fetch dynamic models from APIs where available
 
     Returns:
@@ -885,7 +939,11 @@ def get_model_list(
     # Check cache for unfiltered dynamic fetches
     current_time = time.time()
     use_cache = (
-        dynamic_fetch and not provider_filter and not vision_only and not reasoning_only
+        dynamic_fetch
+        and not provider_filter
+        and not vision_only
+        and not reasoning_only
+        and not include_deprecated
     )
 
     if (
@@ -916,7 +974,9 @@ def get_model_list(
         models = _get_models_for_provider(provider, dynamic_fetch)
 
         # Apply filters
-        filtered_models = _apply_model_filters(models, vision_only, reasoning_only)
+        filtered_models = _apply_model_filters(
+            models, vision_only, reasoning_only, include_deprecated
+        )
         all_models.extend(filtered_models)
 
     # Update cache for unfiltered results
@@ -936,6 +996,10 @@ def _print_simple_format(models: list[ModelMeta]) -> None:
 def _format_model_details(model: ModelMeta, show_pricing: bool = False) -> str:
     """Format model details for display."""
     info_parts = [f"  {model.model}"]
+
+    # Deprecated indicator
+    if model.deprecated:
+        info_parts.append("DEPRECATED")
 
     # Context window
     if model.context:
@@ -993,6 +1057,7 @@ def list_models(
     show_pricing: bool = False,
     vision_only: bool = False,
     reasoning_only: bool = False,
+    include_deprecated: bool = False,
     simple_format: bool = False,
     dynamic_fetch: bool = True,
 ) -> None:
@@ -1004,6 +1069,7 @@ def list_models(
         show_pricing: Include pricing information
         vision_only: Only show models with vision support
         reasoning_only: Only show models with reasoning support
+        include_deprecated: Include deprecated/sunset models
         simple_format: Output one model per line as provider/model
         dynamic_fetch: Fetch dynamic models from APIs where available
     """
@@ -1013,6 +1079,7 @@ def list_models(
             provider_filter=provider_filter,
             vision_only=vision_only,
             reasoning_only=reasoning_only,
+            include_deprecated=include_deprecated,
             dynamic_fetch=dynamic_fetch,
         )
         _print_simple_format(all_models)
@@ -1035,7 +1102,9 @@ def list_models(
                 continue
 
             models = _get_models_for_provider(provider, dynamic_fetch)
-            filtered_models = _apply_model_filters(models, vision_only, reasoning_only)
+            filtered_models = _apply_model_filters(
+                models, vision_only, reasoning_only, include_deprecated
+            )
 
             if not filtered_models:
                 continue

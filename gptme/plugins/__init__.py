@@ -19,11 +19,11 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
-
 # Use the global console from gptme.util (redirected to stderr in ACP mode)
 # instead of creating a separate instance that would default to stdout.
 from gptme.util import console
+
+logger = logging.getLogger(__name__)
 
 # Cache for discovered plugins to avoid repeated discovery
 _plugin_cache: dict[tuple[Path, ...], list[Plugin]] = {}
@@ -439,10 +439,10 @@ def get_install_instructions(plugin_path: Path, env_type: str | None = None) -> 
 
     if env_type == "pipx":
         return f"pipx inject gptme {plugin_path}"
-    elif env_type == "uvx":
+    if env_type == "uvx":
         # Note: uvx doesn't have inject yet, may need different approach
         return f"uv pip install --system -e {plugin_path}"
-    elif env_type == "venv":
+    if env_type == "venv":
         return f"pip install -e {plugin_path}"
-    else:  # system
-        return f"pip install --user -e {plugin_path}"
+    # system
+    return f"pip install --user -e {plugin_path}"

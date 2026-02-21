@@ -11,9 +11,10 @@ import contextvars
 import logging
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from uuid import uuid4
 
+from ..config import get_project_config
 from ..init import init
 from ..llm.models import get_default_model, set_default_model
 from ..logmanager import LogManager
@@ -29,9 +30,6 @@ from .types import (
     ToolCallStatus,
     gptme_tool_to_acp_kind,
 )
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -83,8 +81,11 @@ class GptmeAgent:
         self._conn: Any = None
         self._registry = SessionRegistry()
         self._initialized = False
+        self._init_error: str | None = None
         self._model: str | None = None
         self._tools: list[Any] | None = None
+        # Per-session model overrides (populated from per-project gptme.toml)
+        self._session_models: dict[str, str | None] = {}
         # Phase 2: Track active tool calls per session
         self._tool_calls: dict[str, dict[str, ToolCall]] = {}
         # Phase 2: Permission policies per session (allow_always, reject_always)
@@ -234,15 +235,12 @@ class GptmeAgent:
                     self._permission_policies[session_id] = {}
                 self._permission_policies[session_id][tool_call.kind.value] = "allow"
                 return True
-            elif option_id == "reject-always":
+            if option_id == "reject-always":
                 if session_id not in self._permission_policies:
                     self._permission_policies[session_id] = {}
                 self._permission_policies[session_id][tool_call.kind.value] = "reject"
                 return False
-            elif option_id == "allow-once":
-                return True
-            else:
-                return False
+            return option_id == "allow-once"
 
         except Exception as e:
             logger.warning(f"Permission request failed: {e}, auto-allowing")
@@ -401,7 +399,7 @@ class GptmeAgent:
             )
 
         # Initialize gptme on first connection
-        if not self._initialized:
+        if not self._initialized and not self._init_error:
             try:
                 init(
                     model=self._model,
@@ -409,12 +407,17 @@ class GptmeAgent:
                     tool_allowlist=None,
                     tool_format="markdown",
                 )
-            except (KeyError, ValueError) as e:
-                logger.error(f"gptme initialization failed: {e}")
-                raise RuntimeError(
+            except Exception as e:
+                # Store the error instead of raising — raising would kill the
+                # ACP connection and leave the editor showing "Loading..." with
+                # no explanation. The error is surfaced in prompt() instead.
+                self._init_error = (
                     f"gptme initialization failed: {e}. "
                     "Ensure API keys are set in environment or config.toml."
-                ) from e
+                )
+                logger.error(self._init_error)
+                return InitializeResponse(protocol_version=protocol_version)  # type: ignore[misc]
+
             self._initialized = True
             # Capture the resolved model (from config/env/auto-detect)
             # so subsequent handlers use the same model
@@ -457,7 +460,26 @@ class GptmeAgent:
         if self._tools is not None:
             set_tools(self._tools)
 
+        # Resolve per-project model from gptme.toml in the session's cwd.
+        # Each Zed window may have its own project with a different MODEL in gptme.toml,
+        # so we check the project config and override the global model for this session.
+        session_model = self._model
+        if cwd:
+            project_cfg = get_project_config(Path(cwd))
+            if project_cfg and project_cfg.env.get("MODEL"):
+                session_model = project_cfg.env["MODEL"]
+                logger.info(
+                    f"ACP NewSession: using per-project model {session_model!r} from {cwd}/gptme.toml"
+                )
+
         session_id = uuid4().hex
+
+        # Store per-session model for use in prompt() and other handlers
+        self._session_models[session_id] = session_model
+
+        # Apply session model to context for this task
+        if session_model and session_model != self._model:
+            set_default_model(session_model)
 
         # Create a temporary directory for the log
         logdir = Path(tempfile.mkdtemp(prefix=f"gptme-acp-{session_id[:8]}-"))
@@ -469,7 +491,7 @@ class GptmeAgent:
             tool_format="markdown",
             prompt="full",
             interactive=False,
-            model=self._model,
+            model=session_model,
             workspace=Path(cwd) if cwd else None,
         )
 
@@ -483,6 +505,26 @@ class GptmeAgent:
 
         self._registry.create(session_id, log=log)
         logger.info(f"ACP NewSession: session_id={session_id}, cwd={cwd}")
+
+        # Surface initialization errors proactively on session open, so the user
+        # sees feedback immediately in the Zed ACP panel rather than only after
+        # sending their first prompt. Uses session/update notifications which are
+        # the protocol-correct mechanism for unsolicited agent messages.
+        if self._init_error:
+            from acp import (  # type: ignore[import-not-found]
+                text_block,
+                update_agent_message,
+            )
+
+            error_chunk = update_agent_message(text_block(f"⚠️ {self._init_error}"))
+            if self._conn:
+                await self._conn.session_update(
+                    session_id=session_id,
+                    update=error_chunk,
+                    source="gptme",
+                )
+            # Keep _init_error set so prompt() can still surface it for retries
+            # (the user may send a message before the notification is seen)
 
         assert NewSessionResponse is not None
         return NewSessionResponse(session_id=session_id)
@@ -518,10 +560,28 @@ class GptmeAgent:
             update_agent_message,
         )
 
+        # Surface initialization errors as visible agent messages
+        if self._init_error:
+            error_chunk = update_agent_message(text_block(f"⚠️ {self._init_error}"))
+            if self._conn:
+                await self._conn.session_update(
+                    session_id=session_id,
+                    update=error_chunk,
+                    source="gptme",
+                )
+            # Clear the error so the user can retry after fixing their config
+            self._init_error = None
+            assert PromptResponse is not None
+            return PromptResponse(stop_reason="cancelled")
+
         # Re-set ContextVars that may be missing in this task's context.
         # ACP framework may dispatch each RPC method in a separate asyncio task,
         # so ContextVars set during initialize() aren't visible here.
-        if self._model:
+        # Use per-session model if available (set from per-project gptme.toml in new_session).
+        effective_model = self._session_models.get(session_id, self._model)
+        if effective_model:
+            set_default_model(effective_model)
+        elif self._model:
             set_default_model(self._model)
         if self._tools is not None:
             set_tools(self._tools)
@@ -560,7 +620,7 @@ class GptmeAgent:
                         log=log.log,
                         stream=False,
                         tool_format="markdown",
-                        model=self._model,
+                        model=effective_model,
                     )
                 )
 
@@ -622,18 +682,29 @@ class GptmeAgent:
         logger.warning(f"load_session not yet implemented: {session_id}")
         raise NotImplementedError("Session loading not yet implemented")
 
+    def _cleanup_session(self, session_id: str) -> None:
+        """Remove all per-session state for a given session.
+
+        Cleans up _session_models, _tool_calls, and _permission_policies
+        to prevent unbounded memory growth from accumulated sessions.
+        """
+        self._session_models.pop(session_id, None)
+        self._tool_calls.pop(session_id, None)
+        self._permission_policies.pop(session_id, None)
+        self._registry.remove(session_id)
+
     async def cancel(
         self,
         session_id: str,
         **kwargs: Any,
     ) -> None:
-        """Cancel an ongoing operation (Phase 2 feature).
+        """Cancel an ongoing operation and clean up session state.
 
         Args:
             session_id: Session to cancel
         """
-        # Phase 2: Implement cancellation
-        logger.warning(f"cancel not yet implemented: {session_id}")
+        logger.info(f"Cancelling session {session_id}")
+        self._cleanup_session(session_id)
 
     async def list_sessions(
         self,
@@ -661,7 +732,7 @@ class GptmeAgent:
     ) -> None:
         """Handle authentication request (not supported)."""
         logger.warning(f"authenticate not implemented: {method_id}")
-        return None
+        return
 
     async def set_session_model(
         self,
@@ -669,10 +740,10 @@ class GptmeAgent:
         session_id: str,
         **kwargs: Any,
     ) -> None:
-        """Set the model for a session."""
+        """Set the model for a specific session."""
         logger.info(f"set_session_model: session={session_id}, model={model_id}")
-        self._model = model_id
-        return None
+        self._session_models[session_id] = model_id
+        return
 
     async def set_session_mode(
         self,
@@ -684,7 +755,7 @@ class GptmeAgent:
         logger.warning(
             f"set_session_mode not implemented: session={session_id}, mode={mode_id}"
         )
-        return None
+        return
 
     async def ext_method(
         self,
