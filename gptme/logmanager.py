@@ -72,8 +72,7 @@ class Log:
 
     def write_jsonl(self, path: PathLike) -> None:
         with open(path, "w") as file:
-            for msg in self.messages:
-                file.write(json.dumps(msg.to_dict()) + "\n")
+            file.writelines(json.dumps(msg.to_dict()) + "\n" for msg in self.messages)
 
     def print(self, show_hidden: bool = False):
         print_msg(self.messages, oneline=False, show_hidden=show_hidden)
@@ -289,7 +288,10 @@ class LogManager:
     def log(self, value: Log | list[Message]) -> None:
         if isinstance(value, list):
             value = Log(value)
-        self._branches[self.current_branch] = value
+        if self.current_view is not None:
+            self._views[self.current_view] = value
+        else:
+            self._branches[self.current_branch] = value
 
     @property
     def logfile(self) -> Path:
@@ -362,8 +364,13 @@ class LogManager:
         # create directory if it doesn't exist
         Path(self.logfile).parent.mkdir(parents=True, exist_ok=True)
 
-        # write current branch
-        self.log.write_jsonl(self.logfile)
+        # write current branch (or main branch if on a view)
+        # When on a view, conversation.jsonl must always contain the full main
+        # branch history — the view is persisted separately in views/ directory.
+        if self.current_view is not None:
+            self._branches["main"].write_jsonl(self.logfile)
+        else:
+            self.log.write_jsonl(self.logfile)
 
         # write other branches
         if branches:
@@ -629,8 +636,8 @@ def _conversation_files() -> list[Path]:
     # NOTE: only returns the main conversation, not branches (to avoid duplicates)
     # returns the conversation files sorted by modified time (newest first)
     logsdir = get_logs_dir()
-    return list(
-        sorted(logsdir.glob("*/conversation.jsonl"), key=lambda f: -f.stat().st_mtime)
+    return sorted(
+        logsdir.glob("*/conversation.jsonl"), key=lambda f: -f.stat().st_mtime
     )
 
 
@@ -666,7 +673,8 @@ def get_conversations() -> Generator[ConversationMeta, None, None]:
     for conv_fn in _conversation_files():
         log = Log.read_jsonl(conv_fn, limit=1)
         # TODO: can we avoid reading the entire file? maybe wont even be used, due to user convo filtering
-        len_msgs = conv_fn.read_text().count("}\n{")
+        text = conv_fn.read_text()
+        len_msgs = (1 + text.count("}\n{")) if text.strip() else 0
         assert len(log) <= 1
         modified = conv_fn.stat().st_mtime
         first_timestamp = log[0].timestamp.timestamp() if log else modified
@@ -802,7 +810,7 @@ def _gen_read_jsonl(path: PathLike) -> Generator[Message, None, None]:
     from .util.uri import parse_file_reference
 
     with open(path) as file:
-        for line in file.readlines():
+        for line in file:
             line = line.strip()
             if not line:
                 continue
