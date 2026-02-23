@@ -198,6 +198,7 @@ def cleanup_tmux_sessions():
         try:
             result = subprocess.run(
                 ["tmux", "list-sessions", "-F", "#{session_name}"],
+                check=False,
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -210,6 +211,7 @@ def cleanup_tmux_sessions():
                     if simple_session_pattern.match(session):
                         subprocess.run(
                             ["tmux", "kill-session", "-t", session],
+                            check=False,
                             capture_output=True,
                             timeout=5,
                         )
@@ -257,7 +259,7 @@ def server_thread():
     # Give server time to start (so we don't get Connection Refused)
     time.sleep(0.5)
 
-    yield port  # Return the port to the test
+    return port  # Return the port to the test
 
 
 @pytest.fixture
@@ -271,7 +273,7 @@ def client():
         yield test_client
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture()
 def setup_conversation(server_thread):
     """Create a conversation and return its ID, session ID, and port."""
     port = server_thread
@@ -294,10 +296,10 @@ def setup_conversation(server_thread):
     assert resp.status_code == 200
     session_id = resp.json()["session_id"]
 
-    yield port, conversation_id, session_id
+    return port, conversation_id, session_id
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture()
 def event_listener(setup_conversation):
     """Set up an event listener for the conversation."""
     port, conversation_id, session_id = setup_conversation

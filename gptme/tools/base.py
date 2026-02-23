@@ -29,11 +29,11 @@ import json_repair
 from lxml import etree
 
 from ..codeblock import Codeblock
-from ..hooks import HookFunc
 from ..message import Message
 from ..util import clean_example, transform_examples_to_chat_directives
 
 if TYPE_CHECKING:
+    from ..hooks import HookFunc
     from ..logmanager import Log
 
 logger = logging.getLogger(__name__)
@@ -530,17 +530,14 @@ class ToolUse:
         # collect all tool uses
         tool_uses = []
         if active_format == "xml":
-            for tool_use in cls._iter_from_xml(content):
-                tool_uses.append(tool_use)
+            tool_uses = list(cls._iter_from_xml(content))
         if active_format == "markdown":
-            for tool_use in cls._iter_from_markdown(content, streaming=streaming):
-                tool_uses.append(tool_use)
+            tool_uses = list(cls._iter_from_markdown(content, streaming=streaming))
 
         # return them in the order they appear
         assert all(x.start is not None for x in tool_uses)
         tool_uses.sort(key=lambda x: x.start or 0)
-        for tool_use in tool_uses:
-            yield tool_use
+        yield from tool_uses
 
         # don't continue unless tool format (or override allows it)
         if active_format != "tool":
@@ -735,11 +732,7 @@ def get_path(
     """Get the path from args/kwargs for save, append, and patch."""
     if code is not None and args is not None:
         fn = " ".join(args)
-        if (
-            fn.startswith("save ")
-            or fn.startswith("append ")
-            or fn.startswith("patch ")
-        ):
+        if fn.startswith(("save ", "append ", "patch ")):
             fn = fn.split(" ", 1)[1]
     elif kwargs is not None:
         fn = kwargs.get("path", "")

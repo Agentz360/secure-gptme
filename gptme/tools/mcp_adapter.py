@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Generator
 from logging import getLogger
 from typing import TYPE_CHECKING
 
 import mcp.types as mcp_types
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Generator
+
     from ..hooks.elicitation import ElicitationRequest, ElicitationResponse
 
 from gptme.config import Config, MCPServerConfig, get_config, set_config
@@ -750,8 +751,9 @@ def list_mcp_roots(server_name: str | None = None) -> str:
             return f"No roots configured for server '{server_name}'."
 
         output = [f"# Roots for {server_name}\n"]
-        for root in roots:
-            output.append(f"- **{root.name or '(unnamed)'}**: `{root.uri}`")
+        output.extend(
+            f"- **{root.name or '(unnamed)'}**: `{root.uri}`" for root in roots
+        )
         return "\n".join(output)
     # List roots for all loaded servers
     all_clients = {**_mcp_clients, **_dynamic_servers}

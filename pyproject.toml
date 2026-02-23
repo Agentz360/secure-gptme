@@ -42,7 +42,7 @@ click-default-group = "^1.2.4"
 python-dotenv = "^1.0.0"
 rich = "^13.5.2"
 tabulate = "*"
-pick = "^2.2.0"
+pick = {version = "^2.2.0", markers = "sys_platform != 'win32'"}
 tiktoken = ">=0.7"
 tomlkit = "*"
 typing-extensions = "*"
@@ -203,13 +203,20 @@ select = [
     "I",      # isort
     "C4",     # flake8-comprehensions
     "FURB",   # refurb
+    "FLY",    # flynt (f-string over join)
+    "ISC",    # implicit-str-concat
+    "PLE",    # pylint errors
+    "PERF",   # perflint
     "RSE102", # unnecessary-paren-on-raise-exception
     "SIM103", "SIM110", "SIM117", "SIM118", "SIM300", "SIM910",  # flake8-simplify
-    "PIE790", # flake8-pie
+    "PIE790", "PIE810",  # flake8-pie
     "RET501", "RET505", "RET506", "RET507", "RET508",  # flake8-return
     "RUF010", "RUF019", "RUF100",  # ruff-specific
+    "PLW1510",  # subprocess-run-without-check
+    "TCH001", "TCH002", "TCH003", "TCH004",  # flake8-type-checking
+    "PT003", "PT006", "PT011", "PT022",  # pytest style
 ]
-ignore = ["E402", "E501", "B905"]
+ignore = ["E402", "E501", "B905", "PERF203"]  # PERF203: try-except-in-loop often intentional
 #fixable = ["ALL"]
 #unfixable = ["B"]
 

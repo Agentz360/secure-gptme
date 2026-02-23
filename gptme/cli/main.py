@@ -8,14 +8,18 @@ import signal
 import sys
 import traceback
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
 from typing import Literal
 
 import click
 from click.core import ParameterSource
-from pick import pick
+
+try:
+    from pick import pick
+except ImportError:
+    pick = None  # type: ignore[assignment]
 
 import gptme
 
@@ -353,7 +357,8 @@ def main(
         profile_dir = Path("profiles")
         profile_dir.mkdir(exist_ok=True)
         profile_path = (
-            profile_dir / f"gptme-{datetime.now().strftime('%Y%m%d-%H%M%S')}.prof"
+            profile_dir
+            / f"gptme-{datetime.now(tz=timezone.utc).strftime('%Y%m%d-%H%M%S')}.prof"
         )
 
         def save_profile():
@@ -637,7 +642,10 @@ def pick_log(limit=20) -> Path:  # pragma: no cover
     #     return "-test-" in name or name.startswith("test-")
     # prev_conv_files = [f for f in prev_conv_files if not is_test(f.parent.name)]
 
-    terminal_width = os.get_terminal_size().columns
+    try:
+        terminal_width = os.get_terminal_size().columns
+    except OSError:
+        terminal_width = 80  # Default fallback for Windows/non-TTY
 
     prev_convs: list[str] = []
     for conv in convs:
@@ -655,7 +663,16 @@ def pick_log(limit=20) -> Path:  # pragma: no cover
     )
 
     index: int
-    _, index = pick(options, title)
+    if pick is None:
+        # Fallback when pick library is unavailable (e.g. Windows)
+        from ..util import console
+
+        console.print(f"[bold]{title}[/bold]")
+        for i, option in enumerate(options):
+            console.print(f"  {i}: {option}")
+        index = int(input("Select option number: "))
+    else:
+        _, index = pick(options, title)
     if index == 0:
         return get_logdir("random")
     if index == len(options) - 1:

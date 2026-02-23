@@ -59,6 +59,7 @@ class TestGptmeAgentInit:
         assert agent._model is None
         assert agent._tool_calls == {}
         assert agent._permission_policies == {}
+        assert agent._session_commands_advertised == set()
 
     def test_on_connect(self):
         agent = GptmeAgent()
@@ -512,6 +513,7 @@ class TestCleanupSession:
             )
         }
         agent._permission_policies[sid] = {"execute": "allow"}
+        agent._session_commands_advertised.add(sid)
         agent._registry.create(sid)
 
         agent._cleanup_session(sid)
@@ -519,6 +521,7 @@ class TestCleanupSession:
         assert sid not in agent._session_models
         assert sid not in agent._tool_calls
         assert sid not in agent._permission_policies
+        assert sid not in agent._session_commands_advertised
         assert agent._registry.get(sid) is None
 
     def test_cleanup_idempotent_on_unknown_session(self):
@@ -632,6 +635,47 @@ class TestPerSessionModel:
         model_with_routing = "z-ai/glm-5@together"
         _run(agent.set_session_model(model_id=model_with_routing, session_id="s1"))
         assert agent._session_models["s1"] == model_with_routing
+
+
+class TestSendAvailableCommands:
+    """Tests for _send_available_commands method."""
+
+    def test_no_connection_returns_without_error(self):
+        """Without a connection, _send_available_commands should return silently."""
+        agent = GptmeAgent()
+        assert agent._conn is None
+        # Should not raise
+        _run(agent._send_available_commands("session_1"))
+        assert "session_1" not in agent._session_commands_advertised
+
+    def test_already_advertised_skips(self):
+        """If session already advertised, should not call session_update again."""
+        agent = _make_agent_with_conn()
+        agent._session_commands_advertised.add("session_1")
+        _run(agent._send_available_commands("session_1"))
+        agent._conn.session_update.assert_not_awaited()
+
+    def test_failure_does_not_add_to_advertised(self):
+        """If send fails, session should not be added to _session_commands_advertised."""
+        agent = GptmeAgent()
+        conn = MagicMock()
+        conn.session_update = AsyncMock(side_effect=RuntimeError("connection lost"))
+        agent._conn = conn
+
+        _run(agent._send_available_commands("session_1"))
+
+        assert "session_1" not in agent._session_commands_advertised
+
+    def test_cleanup_removes_from_advertised(self):
+        """_cleanup_session should remove session from _session_commands_advertised."""
+        agent = GptmeAgent()
+        agent._session_commands_advertised.add("s1")
+        agent._session_commands_advertised.add("s2")
+
+        agent._cleanup_session("s1")
+
+        assert "s1" not in agent._session_commands_advertised
+        assert "s2" in agent._session_commands_advertised
 
 
 def _make_mock_acp_factories():
@@ -766,3 +810,97 @@ class TestHandleSlashCommand:
 
         assert result["stop_reason"] == "end_turn"
         agent._conn.session_update.assert_awaited_once()
+
+
+class TestConnNullGuard:
+    """Tests for connection null guards in prompt error paths.
+
+    Ensures that session_update calls are guarded against self._conn being None,
+    which can happen if the client disconnects or if prompt() is called before
+    on_connect().
+    """
+
+    def test_complete_pending_tool_calls_no_conn(self):
+        """_complete_pending_tool_calls should work without a connection."""
+        agent = GptmeAgent()
+        # Populate a pending tool call
+        tc = ToolCall(
+            tool_call_id="call_1",
+            title="Test",
+            kind=ToolKind.EXECUTE,
+            status=ToolCallStatus.IN_PROGRESS,
+        )
+        agent._tool_calls["s1"] = {"call_1": tc}
+
+        # Should not raise even without self._conn
+        _run(agent._complete_pending_tool_calls("s1", success=False))
+
+    def test_report_tool_call_no_conn_stores_nothing(self):
+        """_report_tool_call without connection should not store the call."""
+        agent = GptmeAgent()
+        assert agent._conn is None
+
+        tc = ToolCall(
+            tool_call_id="call_orphan",
+            title="Orphan",
+            kind=ToolKind.EXECUTE,
+        )
+        _run(agent._report_tool_call("s1", tc))
+        # Early return means no storage
+        assert "s1" not in agent._tool_calls
+
+    def test_update_tool_call_no_conn_silently_returns(self):
+        """_update_tool_call without connection should not raise."""
+        agent = GptmeAgent()
+        assert agent._conn is None
+
+        # Should not raise
+        _run(agent._update_tool_call("s1", "call_1", ToolCallStatus.COMPLETED))
+
+
+class TestGetCommandsWithDescriptions:
+    """Tests for the get_commands_with_descriptions helper."""
+
+    def test_returns_nonempty_list(self):
+        """Should return a non-empty list of (name, description) tuples."""
+        from gptme.commands import get_commands_with_descriptions
+
+        commands = get_commands_with_descriptions()
+        assert len(commands) > 0
+        for name, desc in commands:
+            assert isinstance(name, str) and len(name) > 0
+            assert isinstance(desc, str) and len(desc) > 0
+
+    def test_includes_builtin_commands(self):
+        """Should include built-in commands like help, model, tools."""
+        from gptme.commands import get_commands_with_descriptions
+
+        names = {name for name, _ in get_commands_with_descriptions()}
+        assert "help" in names
+        assert "model" in names
+        assert "tools" in names
+
+    def test_descriptions_match_action_descriptions(self):
+        """Built-in command descriptions should match action_descriptions."""
+        from gptme.commands import get_commands_with_descriptions
+        from gptme.commands.meta import action_descriptions
+
+        cmd_dict = dict(get_commands_with_descriptions())
+        for name, desc in action_descriptions.items():
+            if name in cmd_dict:
+                assert cmd_dict[name] == desc
+
+    def test_sorted_by_name(self):
+        """Commands should be sorted alphabetically by name."""
+        from gptme.commands import get_commands_with_descriptions
+
+        commands = get_commands_with_descriptions()
+        names = [name for name, _ in commands]
+        assert names == sorted(names)
+
+    def test_no_duplicate_names(self):
+        """Each command name should appear only once."""
+        from gptme.commands import get_commands_with_descriptions
+
+        names = [name for name, _ in get_commands_with_descriptions()]
+        assert len(names) == len(set(names))

@@ -11,14 +11,13 @@ import contextvars
 import logging
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from ..config import get_project_config
 from ..init import init
 from ..llm.models import get_default_model, set_default_model
 from ..logmanager import LogManager
-from ..message import Message
 from ..prompts import get_prompt
 from ..session import SessionRegistry
 from ..tools import get_tools, set_tools
@@ -31,6 +30,9 @@ from .types import (
     gptme_tool_to_acp_kind,
 )
 
+if TYPE_CHECKING:
+    from ..message import Message
+
 logger = logging.getLogger(__name__)
 
 # Lazy imports to avoid dependency issues when acp is not installed
@@ -39,6 +41,19 @@ InitializeResponse: type | None = None
 NewSessionResponse: type | None = None
 PromptResponse: type | None = None
 Client: type | None = None
+
+
+def _check_acp_import(cls: type | None, name: str) -> type:
+    """Verify a lazy-imported ACP class is available.
+
+    Uses explicit check instead of assert, which can be disabled with python -O.
+    See also: server/api.py and server/api_v2.py for the same pattern.
+    """
+    if cls is None:
+        raise RuntimeError(
+            f"ACP class {name} not imported; is the 'acp' package installed?"
+        )
+    return cls
 
 
 def _import_acp() -> bool:
@@ -90,6 +105,10 @@ class GptmeAgent:
         self._tool_calls: dict[str, dict[str, ToolCall]] = {}
         # Phase 2: Permission policies per session (allow_always, reject_always)
         self._permission_policies: dict[str, dict[str, str]] = {}
+        # Track sessions where AvailableCommandsUpdate was successfully sent.
+        # Used to resend on first prompt() if new_session() notification was lost
+        # (race condition: Zed may not set up listener until after NewSessionResponse).
+        self._session_commands_advertised: set[str] = set()
 
     def on_connect(self, conn: Any) -> None:
         """Called when a client connects.
@@ -416,7 +435,9 @@ class GptmeAgent:
                     "Ensure API keys are set in environment or config.toml."
                 )
                 logger.error(self._init_error)
-                return InitializeResponse(protocol_version=protocol_version)  # type: ignore[misc]
+                return _check_acp_import(InitializeResponse, "InitializeResponse")(
+                    protocol_version=protocol_version
+                )  # type: ignore[misc]
 
             self._initialized = True
             # Capture the resolved model (from config/env/auto-detect)
@@ -428,8 +449,10 @@ class GptmeAgent:
             self._tools = get_tools()
 
         logger.info(f"ACP Initialize: protocol_version={protocol_version}")
-        assert InitializeResponse is not None
-        return InitializeResponse(protocol_version=protocol_version)
+        _InitializeResponse = _check_acp_import(
+            InitializeResponse, "InitializeResponse"
+        )
+        return _InitializeResponse(protocol_version=protocol_version)
 
     async def new_session(
         self,
@@ -506,6 +529,28 @@ class GptmeAgent:
         self._registry.create(session_id, log=log)
         logger.info(f"ACP NewSession: session_id={session_id}, cwd={cwd}")
 
+        # Surface session info proactively on session open, so the user sees
+        # which model and workspace are active immediately in the Zed ACP panel.
+        # Uses session/update notifications — the protocol-correct mechanism for
+        # unsolicited agent messages.
+        if self._conn:
+            from acp import (  # type: ignore[import-not-found]
+                text_block,
+                update_agent_message,
+            )
+
+            model_info = session_model or "default"
+            workspace_info = str(cwd) if cwd else "none"
+            info_text = (
+                f"ℹ️ Using model: {model_info}\nUsing workspace: {workspace_info}"
+            )
+            info_chunk = update_agent_message(text_block(info_text))
+            await self._conn.session_update(
+                session_id=session_id,
+                update=info_chunk,
+                source="gptme",
+            )
+
         # Surface initialization errors proactively on session open, so the user
         # sees feedback immediately in the Zed ACP panel rather than only after
         # sending their first prompt. Uses session/update notifications which are
@@ -526,8 +571,54 @@ class GptmeAgent:
             # Keep _init_error set so prompt() can still surface it for retries
             # (the user may send a message before the notification is seen)
 
-        assert NewSessionResponse is not None
-        return NewSessionResponse(session_id=session_id)
+        # Advertise available slash commands for client-side autocomplete.
+        # NOTE: This is also called at the start of prompt() as a fallback for
+        # clients (like Zed) that may not receive session/update notifications
+        # sent before NewSessionResponse is returned (race condition on session open).
+        await self._send_available_commands(session_id)
+
+        _NewSessionResponse = _check_acp_import(
+            NewSessionResponse, "NewSessionResponse"
+        )
+        return _NewSessionResponse(session_id=session_id)
+
+    async def _send_available_commands(self, session_id: str) -> None:
+        """Send AvailableCommandsUpdate notification to advertise slash commands.
+
+        Called during new_session() and as a fallback at the start of the first
+        prompt() call. The fallback handles a race condition where some clients
+        (e.g. Zed) may not receive session/update notifications sent before
+        NewSessionResponse is returned.
+        """
+        if not self._conn or session_id in self._session_commands_advertised:
+            return
+        try:
+            from acp.helpers import (  # type: ignore[import-not-found]
+                update_available_commands,
+            )
+            from acp.schema import (  # type: ignore[import-not-found]
+                AvailableCommand,
+            )
+
+            from ..commands import get_commands_with_descriptions
+
+            acp_commands = [
+                AvailableCommand(name=f"/{name}", description=desc)
+                for name, desc in get_commands_with_descriptions()
+            ]
+            await self._conn.session_update(
+                session_id=session_id,
+                update=update_available_commands(acp_commands),
+                source="gptme",
+            )
+            self._session_commands_advertised.add(session_id)
+            logger.info(
+                f"ACP AvailableCommandsUpdate: sent {len(acp_commands)} commands"
+                f" for session {session_id[:8]}"
+            )
+        except Exception as e:
+            # Non-fatal: clients still work without autocomplete
+            logger.warning(f"Failed to send available commands: {e}", exc_info=True)
 
     async def _handle_slash_command(
         self,
@@ -571,8 +662,8 @@ class GptmeAgent:
                     update=error_chunk,
                     source="gptme",
                 )
-            assert PromptResponse is not None
-            return PromptResponse(stop_reason="end_turn")
+            _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
+            return _PromptResponse(stop_reason="end_turn")
 
         # Capture stdout from commands that use print() (e.g. /help, /tools)
         captured = io.StringIO()
@@ -592,17 +683,17 @@ class GptmeAgent:
                     update=error_chunk,
                     source="gptme",
                 )
-            assert PromptResponse is not None
-            return PromptResponse(stop_reason="cancelled")
+            _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
+            return _PromptResponse(stop_reason="cancelled")
 
         # Combine captured stdout with any yielded system messages
         output_parts: list[str] = []
         stdout_output = captured.getvalue()
         if stdout_output:
             output_parts.append(stdout_output.rstrip())
-        for resp_msg in response_msgs:
-            if resp_msg.content:
-                output_parts.append(resp_msg.content)
+        output_parts.extend(
+            resp_msg.content for resp_msg in response_msgs if resp_msg.content
+        )
 
         output = "\n".join(output_parts) if output_parts else f"/{cmd_name}: done"
 
@@ -614,8 +705,8 @@ class GptmeAgent:
                 source="gptme",
             )
 
-        assert PromptResponse is not None
-        return PromptResponse(stop_reason="end_turn")
+        _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
+        return _PromptResponse(stop_reason="end_turn")
 
     async def prompt(
         self,
@@ -659,8 +750,8 @@ class GptmeAgent:
                 )
             # Clear the error so the user can retry after fixing their config
             self._init_error = None
-            assert PromptResponse is not None
-            return PromptResponse(stop_reason="cancelled")
+            _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
+            return _PromptResponse(stop_reason="cancelled")
 
         # Re-set ContextVars that may be missing in this task's context.
         # ACP framework may dispatch each RPC method in a separate asyncio task,
@@ -674,15 +765,21 @@ class GptmeAgent:
         if self._tools is not None:
             set_tools(self._tools)
 
+        # Resend AvailableCommandsUpdate if not yet acknowledged for this session.
+        # Handles race condition: some clients (e.g. Zed) may not receive
+        # session/update notifications sent before NewSessionResponse returns.
+        await self._send_available_commands(session_id)
+
         session = self._registry.get(session_id)
         if not session:
             logger.error(f"Unknown session: {session_id}")
-            assert PromptResponse is not None
-            return PromptResponse(stop_reason="cancelled")
+            _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
+            return _PromptResponse(stop_reason="cancelled")
         # Update last_activity timestamp for cleanup tracking
         session.touch()
         log = session.log
-        assert log is not None, "ACP sessions must have a log"
+        if log is None:
+            raise RuntimeError("ACP sessions must have a log")
 
         # Convert ACP prompt to gptme message
         msg = acp_content_to_gptme_message(prompt, "user")
@@ -736,7 +833,7 @@ class GptmeAgent:
                     content = gptme_message_to_acp_content(response_msg)
                     for block in content:
                         text = block.get("text", "")
-                        if text:
+                        if text and self._conn:
                             chunk = update_agent_message(text_block(text))
                             await self._conn.session_update(
                                 session_id=session_id,
@@ -746,8 +843,8 @@ class GptmeAgent:
                     # Also add to log
                     log.append(response_msg)
 
-            assert PromptResponse is not None
-            return PromptResponse(stop_reason="end_turn")
+            _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
+            return _PromptResponse(stop_reason="end_turn")
 
         except Exception as e:
             logger.exception(f"Error processing prompt: {e}")
@@ -755,13 +852,14 @@ class GptmeAgent:
             await self._complete_pending_tool_calls(session_id, success=False)
             # Send error message
             error_chunk = update_agent_message(text_block(f"Error: {e}"))
-            await self._conn.session_update(
-                session_id=session_id,
-                update=error_chunk,
-                source="gptme",
-            )
-            assert PromptResponse is not None
-            return PromptResponse(stop_reason="cancelled")
+            if self._conn:
+                await self._conn.session_update(
+                    session_id=session_id,
+                    update=error_chunk,
+                    source="gptme",
+                )
+            _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
+            return _PromptResponse(stop_reason="cancelled")
 
     async def load_session(
         self,
@@ -789,6 +887,7 @@ class GptmeAgent:
         self._session_models.pop(session_id, None)
         self._tool_calls.pop(session_id, None)
         self._permission_policies.pop(session_id, None)
+        self._session_commands_advertised.discard(session_id)
         self._registry.remove(session_id)
 
     async def cancel(

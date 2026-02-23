@@ -2,15 +2,18 @@
 
 import logging
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ...message import Message
 from ...util.uri import URI
-from .base import ContextSelector
 from .file_config import FileSelectorConfig
 from .file_integration import FileItem
 from .hybrid import HybridSelector
+
+if TYPE_CHECKING:
+    from .base import ContextSelector
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +140,7 @@ def select_relevant_files(
                 candidates[f] = 0
 
     # Convert to FileItems with metadata
-    now = datetime.now().timestamp()
+    now = datetime.now(tz=timezone.utc).timestamp()
     file_items = []
 
     # Pre-calculate counts for mentioned files only (optimization)

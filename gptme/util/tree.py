@@ -27,6 +27,7 @@ def get_tree_output(workspace: Path, method: TreeMethod = "git") -> str | None:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
+            check=False,
             cwd=workspace,
             capture_output=True,
             text=True,
@@ -62,6 +63,7 @@ def get_tree_output(workspace: Path, method: TreeMethod = "git") -> str | None:
         try:
             result = subprocess.run(
                 shlex.split(methods[current_method]),
+                check=False,
                 cwd=workspace,
                 capture_output=True,
                 text=True,
@@ -108,10 +110,7 @@ def _reduce_tree_output_by_depth(output: str, budget: int = 20000) -> str | None
 
     # Try reducing depth from max down to 0
     for depth in range(max_depth, -1, -1):
-        filtered_lines = []
-        for line in lines:
-            if line.count("/") <= depth:
-                filtered_lines.append(line)
+        filtered_lines = [line for line in lines if line.count("/") <= depth]
 
         filtered_output = "\n".join(filtered_lines)
         if len(filtered_output) <= budget:
