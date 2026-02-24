@@ -2,8 +2,9 @@ import logging
 import re
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import (
+    TYPE_CHECKING,
     Literal,
     TypedDict,
     cast,
@@ -13,6 +14,9 @@ from typing import (
 from typing_extensions import NotRequired
 
 from .llm_openai_models import OPENAI_MODELS
+
+if TYPE_CHECKING:
+    from ..tools.base import ToolFormat
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +108,9 @@ class ModelMeta:
     # whether the model is deprecated/sunset by the provider
     deprecated: bool = False
 
+    # preferred tool format for this model (used as fallback when not explicitly set)
+    default_tool_format: "ToolFormat | None" = None
+
     @property
     def full(self) -> str:
         # For unknown providers (including custom providers), the model field
@@ -128,6 +135,9 @@ class _ModelDictMeta(TypedDict):
     knowledge_cutoff: NotRequired[datetime]
     deprecated: NotRequired[bool]
 
+    # preferred tool format for this model
+    default_tool_format: NotRequired["ToolFormat"]
+
 
 # default model - using ContextVar for thread safety
 _default_model_var: ContextVar[ModelMeta | None] = ContextVar(
@@ -141,6 +151,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
     # OpenAI Subscription (ChatGPT Plus/Pro via Codex backend)
     # All models share same specs; price is 0 since using existing subscription
     # Reasoning level suffix (e.g., :high) is stripped at lookup time in get_model()
+    # These models work best with native tool calling ("tool" format)
     "openai-subscription": {
         model: {
             "context": 128_000,
@@ -150,6 +161,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "supports_streaming": True,
             "supports_vision": True,
             "supports_reasoning": True,
+            "default_tool_format": "tool",
         }
         for model in [
             "gpt-5.3-codex",
@@ -172,7 +184,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "supports_vision": True,
             "supports_reasoning": True,
             "knowledge_cutoff": datetime(
-                2025, 8, 1
+                2025, 8, 1, tzinfo=timezone.utc
             ),  # training cutoff Aug 2025, reliable May 2025
         },
         "claude-sonnet-4-6": {
@@ -183,7 +195,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "supports_vision": True,
             "supports_reasoning": True,
             "knowledge_cutoff": datetime(
-                2026, 1, 1
+                2026, 1, 1, tzinfo=timezone.utc
             ),  # training cutoff Jan 2026, reliable Aug 2025
         },
         "claude-opus-4-5-20251101": {
@@ -194,7 +206,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "supports_vision": True,
             "supports_reasoning": True,
             "knowledge_cutoff": datetime(
-                2025, 8, 1
+                2025, 8, 1, tzinfo=timezone.utc
             ),  # training cutoff Aug 2025, reliable May 2025
         },
         "claude-sonnet-4-5-20250929": {
@@ -205,7 +217,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "supports_vision": True,
             "supports_reasoning": True,
             "knowledge_cutoff": datetime(
-                2025, 7, 1
+                2025, 7, 1, tzinfo=timezone.utc
             ),  # training cutoff Jul 2025, reliable Jan 2025
         },
         "claude-haiku-4-5-20251001": {
@@ -215,7 +227,9 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_output": 5,
             "supports_vision": True,
             "supports_reasoning": True,
-            "knowledge_cutoff": datetime(2025, 7, 1),  # "reliable cutoff" is Feb 2025
+            "knowledge_cutoff": datetime(
+                2025, 7, 1, tzinfo=timezone.utc
+            ),  # "reliable cutoff" is Feb 2025
         },
         "claude-opus-4-1-20250805": {
             "context": 200_000,
@@ -224,7 +238,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_output": 75,
             "supports_vision": True,
             "supports_reasoning": True,
-            "knowledge_cutoff": datetime(2025, 3, 1),
+            "knowledge_cutoff": datetime(2025, 3, 1, tzinfo=timezone.utc),
         },
         "claude-opus-4-20250514": {
             "context": 200_000,
@@ -233,7 +247,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_output": 75,
             "supports_vision": True,
             "supports_reasoning": True,
-            "knowledge_cutoff": datetime(2025, 3, 1),
+            "knowledge_cutoff": datetime(2025, 3, 1, tzinfo=timezone.utc),
         },
         "claude-sonnet-4-20250514": {
             "context": 200_000,
@@ -242,7 +256,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_output": 15,
             "supports_vision": True,
             "supports_reasoning": True,
-            "knowledge_cutoff": datetime(2025, 3, 1),
+            "knowledge_cutoff": datetime(2025, 3, 1, tzinfo=timezone.utc),
         },
         "claude-3-7-sonnet-20250219": {
             "context": 200_000,
@@ -251,7 +265,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_output": 15,
             "supports_vision": True,
             "supports_reasoning": True,
-            "knowledge_cutoff": datetime(2024, 10, 1),
+            "knowledge_cutoff": datetime(2024, 10, 1, tzinfo=timezone.utc),
             "deprecated": True,  # superseded by claude-sonnet-4+
         },
         "claude-3-5-sonnet-20241022": {
@@ -260,7 +274,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_input": 3,
             "price_output": 15,
             "supports_vision": True,
-            "knowledge_cutoff": datetime(2024, 4, 1),
+            "knowledge_cutoff": datetime(2024, 4, 1, tzinfo=timezone.utc),
             "deprecated": True,  # superseded by claude-sonnet-4+
         },
         "claude-3-5-sonnet-20240620": {
@@ -269,7 +283,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_input": 3,
             "price_output": 15,
             "supports_vision": True,
-            "knowledge_cutoff": datetime(2024, 4, 1),
+            "knowledge_cutoff": datetime(2024, 4, 1, tzinfo=timezone.utc),
             "deprecated": True,  # superseded by claude-3-5-sonnet-20241022
         },
         "claude-3-5-haiku-20241022": {
@@ -278,7 +292,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_input": 1,
             "price_output": 5,
             "supports_vision": True,
-            "knowledge_cutoff": datetime(2024, 4, 1),
+            "knowledge_cutoff": datetime(2024, 4, 1, tzinfo=timezone.utc),
             "deprecated": True,  # superseded by claude-haiku-4-5
         },
         "claude-3-haiku-20240307": {
@@ -287,7 +301,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_input": 0.25,
             "price_output": 1.25,
             "supports_vision": True,
-            "knowledge_cutoff": datetime(2024, 4, 1),
+            "knowledge_cutoff": datetime(2024, 4, 1, tzinfo=timezone.utc),
             "deprecated": True,  # superseded by claude-3-5-haiku
         },
         "claude-3-opus-20240229": {
@@ -296,7 +310,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_input": 15,
             "price_output": 75,
             "supports_vision": True,
-            "knowledge_cutoff": datetime(2023, 8, 1),
+            "knowledge_cutoff": datetime(2023, 8, 1, tzinfo=timezone.utc),
             "deprecated": True,  # superseded by claude-opus-4+
         },
         "claude-3-opus-latest": {
@@ -305,7 +319,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_input": 15,
             "price_output": 75,
             "supports_vision": True,
-            "knowledge_cutoff": datetime(2023, 8, 1),
+            "knowledge_cutoff": datetime(2023, 8, 1, tzinfo=timezone.utc),
             "deprecated": True,  # resolves to claude-3-opus-20240229 (deprecated)
         },
     },

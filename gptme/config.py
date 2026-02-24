@@ -950,12 +950,20 @@ class Config:
         return mcp
 
     def get_env(self, key: str, default: str | None = None) -> str | None:
-        """Gets an environment variable, checks the config file if it's not set in the environment."""
+        """Gets an environment variable, checks the config file if it's not set in the environment.
+
+        Checks both ``GPTME_<KEY>`` and ``<KEY>`` forms for environment variables,
+        with the prefixed form taking precedence. Config file lookups always use
+        the bare (unprefixed) key.
+        """
+        prefixed = f"GPTME_{key}" if not key.startswith("GPTME_") else key
+        bare = key.removeprefix("GPTME_") if key.startswith("GPTME_") else key
         return (
-            os.environ.get(key)
-            or (self.chat and self.chat.env.get(key))
-            or (self.project and self.project.env.get(key))
-            or self.user.env.get(key)
+            os.environ.get(prefixed)
+            or os.environ.get(bare)
+            or (self.chat and self.chat.env.get(bare))
+            or (self.project and self.project.env.get(bare))
+            or self.user.env.get(bare)
             or default
         )
 
@@ -1030,6 +1038,21 @@ def reload_config() -> Config:
 
     assert config
     return config
+
+
+def _get_model_default_tool_format(model: str | None) -> str | None:
+    """Get the model's preferred tool format, if any.
+
+    Returns the default_tool_format from ModelMeta, or None if not set."""
+    if not model:
+        return None
+    try:
+        from .llm.models import get_model
+
+        meta = get_model(model)
+        return meta.default_tool_format
+    except Exception:
+        return None
 
 
 def setup_config_from_cli(
@@ -1112,6 +1135,7 @@ def setup_config_from_cli(
                 resolved_tool_allowlist.append("complete")
         elif "complete" not in resolved_tool_allowlist:
             resolved_tool_allowlist.append("complete")
+        logger.debug("Added 'complete' tool to allowlist for non-interactive mode")
 
     # Handle tool_format with similar precedence
     if tool_format is not None:
@@ -1121,10 +1145,20 @@ def setup_config_from_cli(
         # When resuming, use saved conversation tool_format unless CLI override provided
         resolved_tool_format = existing_chat_config.tool_format
     else:
-        # Fall back to env/config for new conversations or when no saved tool_format
-        resolved_tool_format = (
-            cast("ToolFormat", config.get_env("TOOL_FORMAT")) or "markdown"
-        )
+        # Fall back to env/config, then model default, then "markdown"
+        env_tool_format = config.get_env("TOOL_FORMAT")
+        model_tool_format = _get_model_default_tool_format(resolved_model)
+        if env_tool_format:
+            resolved_tool_format = cast("ToolFormat", env_tool_format)
+        elif model_tool_format:
+            resolved_tool_format = cast("ToolFormat", model_tool_format)
+            logger.info(
+                "Using model default tool_format=%s for %s",
+                model_tool_format,
+                resolved_model,
+            )
+        else:
+            resolved_tool_format = "markdown"
 
     # Handle agent_path with similar precedence
     resolved_agent_path: Path | None = agent_path

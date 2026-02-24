@@ -9,18 +9,19 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
-import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from uuid import uuid4
 
 from ..config import get_project_config
+from ..dirs import get_logs_dir
 from ..init import init
 from ..llm.models import get_default_model, set_default_model
-from ..logmanager import LogManager
+from ..logmanager import LogManager, list_conversations
 from ..prompts import get_prompt
 from ..session import SessionRegistry
 from ..tools import get_tools, set_tools
+from ..util.auto_naming import generate_conversation_id
 from .adapter import acp_content_to_gptme_message, gptme_message_to_acp_content
 from .types import (
     PermissionKind,
@@ -101,13 +102,16 @@ class GptmeAgent:
         self._tools: list[Any] | None = None
         # Per-session model overrides (populated from per-project gptme.toml)
         self._session_models: dict[str, str | None] = {}
+        # Per-session mode (default: "default", can be "auto" for no-confirm)
+        self._session_modes: dict[str, str] = {}
         # Phase 2: Track active tool calls per session
         self._tool_calls: dict[str, dict[str, ToolCall]] = {}
         # Phase 2: Permission policies per session (allow_always, reject_always)
         self._permission_policies: dict[str, dict[str, str]] = {}
         # Track sessions where AvailableCommandsUpdate was successfully sent.
-        # Used to resend on first prompt() if new_session() notification was lost
-        # (race condition: Zed may not set up listener until after NewSessionResponse).
+        # Used to deduplicate sends between _send_session_open_notifications()
+        # and the prompt() fallback (in case the deferred notification races
+        # with an early first prompt).
         self._session_commands_advertised: set[str] = set()
 
     def on_connect(self, conn: Any) -> None:
@@ -202,6 +206,14 @@ class GptmeAgent:
         """
         if not self._conn:
             # No connection - auto-allow for backward compatibility
+            return True
+
+        # In "auto" mode, skip permission prompts (like --no-confirm)
+        if self._session_modes.get(session_id) == "auto":
+            logger.debug(
+                f"Auto-approving {tool_call.kind.value} in auto mode "
+                f"(session={session_id})"
+            )
             return True
 
         # Check cached permission policies
@@ -495,7 +507,12 @@ class GptmeAgent:
                     f"ACP NewSession: using per-project model {session_model!r} from {cwd}/gptme.toml"
                 )
 
-        session_id = uuid4().hex
+        # Use conversation ID as session ID for persistence.
+        # This makes sessions discoverable by list_sessions and resumable
+        # by load_session across ACP server restarts.
+        logs_dir = get_logs_dir()
+        session_id = generate_conversation_id(name=None, logs_dir=logs_dir)
+        logdir = logs_dir / session_id
 
         # Store per-session model for use in prompt() and other handlers
         self._session_models[session_id] = session_model
@@ -503,9 +520,6 @@ class GptmeAgent:
         # Apply session model to context for this task
         if session_model and session_model != self._model:
             set_default_model(session_model)
-
-        # Create a temporary directory for the log
-        logdir = Path(tempfile.mkdtemp(prefix=f"gptme-acp-{session_id[:8]}-"))
 
         # Get tools and initial prompt
         tools = get_tools()
@@ -526,69 +540,161 @@ class GptmeAgent:
             lock=False,
         )
 
-        self._registry.create(session_id, log=log)
+        self._registry.create(session_id, log=log, cwd=str(cwd) if cwd else None)
         logger.info(f"ACP NewSession: session_id={session_id}, cwd={cwd}")
 
-        # Surface session info proactively on session open, so the user sees
-        # which model and workspace are active immediately in the Zed ACP panel.
-        # Uses session/update notifications — the protocol-correct mechanism for
-        # unsolicited agent messages.
+        # Schedule session-open notifications to run AFTER NewSessionResponse is
+        # returned. Sending session/update notifications synchronously during
+        # new_session() causes Zed to reject them with "Failed to get session"
+        # because Zed only registers the session after it processes the response.
+        # By deferring with asyncio.sleep(0) we let the event loop flush the
+        # response to the socket before sending notifications.
         if self._conn:
+            asyncio.create_task(
+                self._send_session_open_notifications(session_id, session_model, cwd)
+            )
+
+        _NewSessionResponse = _check_acp_import(
+            NewSessionResponse, "NewSessionResponse"
+        )
+
+        # Build modes and models state for the session response.
+        modes = self._build_modes_state(session_id)
+        models = self._build_models_state(session_model)
+
+        return _NewSessionResponse(
+            session_id=session_id,
+            modes=modes,
+            models=models,
+        )
+
+    def _build_modes_state(self, session_id: str) -> Any:
+        """Build SessionModeState for the session response.
+
+        gptme supports two modes:
+        - default: Interactive mode (tools require confirmation)
+        - auto: Autonomous mode (tools run without confirmation, like --no-confirm)
+        """
+        try:
+            from acp.schema import (  # type: ignore[import-not-found]
+                SessionMode,
+                SessionModeState,
+            )
+        except ImportError:
+            return None
+
+        current_mode = self._session_modes.get(session_id, "default")
+        return SessionModeState(
+            available_modes=[
+                SessionMode(
+                    id="default",
+                    name="Default",
+                    description="Interactive mode — tools require confirmation before executing",
+                ),
+                SessionMode(
+                    id="auto",
+                    name="Auto",
+                    description="Autonomous mode — tools run without confirmation",
+                ),
+            ],
+            current_mode_id=current_mode,
+        )
+
+    def _build_models_state(self, session_model: str | None) -> Any:
+        """Build SessionModelState from gptme's model registry."""
+        try:
+            from acp.schema import (  # type: ignore[import-not-found]
+                ModelInfo,
+                SessionModelState,
+            )
+        except ImportError:
+            return None
+
+        from ..llm.models import MODELS
+
+        available: list[Any] = []
+        for provider, models_dict in MODELS.items():
+            for model_name, meta in models_dict.items():
+                if meta.get("deprecated", False):
+                    continue
+                model_id = f"{provider}/{model_name}"
+                available.append(
+                    ModelInfo(
+                        model_id=model_id,
+                        name=model_name,
+                        description=f"{provider} — context: {meta['context']:,} tokens",
+                    )
+                )
+
+        current = session_model or (self._model or "default")
+        return SessionModelState(
+            available_models=available,
+            current_model_id=current,
+        )
+
+    async def _send_session_open_notifications(
+        self, session_id: str, session_model: str | None, cwd: str
+    ) -> None:
+        """Send session-open notifications after NewSessionResponse is returned.
+
+        Must run as an asyncio.create_task() so it executes after the current
+        coroutine (new_session) returns. This gives Zed time to process
+        NewSessionResponse and register the session before we send notifications
+        that reference the session_id.
+        """
+        # Yield to the event loop so new_session() can return and the response
+        # can be flushed to the socket before we send notifications.
+        await asyncio.sleep(0)
+
+        if not self._conn:
+            return
+
+        try:
             from acp import (  # type: ignore[import-not-found]
                 text_block,
                 update_agent_message,
             )
+        except ImportError:
+            logger.debug("acp not installed, skipping session-open notifications")
+            await self._send_available_commands(session_id)
+            return
 
-            model_info = session_model or "default"
-            workspace_info = str(cwd) if cwd else "none"
-            info_text = (
-                f"ℹ️ Using model: {model_info}\nUsing workspace: {workspace_info}"
-            )
-            info_chunk = update_agent_message(text_block(info_text))
+        # Surface model and workspace info immediately in the ACP panel.
+        model_info = session_model or "default"
+        workspace_info = str(cwd) if cwd else "none"
+        info_text = f"ℹ️ Using model: {model_info}\nUsing workspace: {workspace_info}"
+        info_chunk = update_agent_message(text_block(info_text))
+        try:
             await self._conn.session_update(
                 session_id=session_id,
                 update=info_chunk,
                 source="gptme",
             )
+        except Exception as e:
+            logger.debug(f"Failed to send session info notification: {e}")
 
-        # Surface initialization errors proactively on session open, so the user
-        # sees feedback immediately in the Zed ACP panel rather than only after
-        # sending their first prompt. Uses session/update notifications which are
-        # the protocol-correct mechanism for unsolicited agent messages.
+        # Surface initialization errors immediately so the user sees them
+        # without having to send a prompt.
         if self._init_error:
-            from acp import (  # type: ignore[import-not-found]
-                text_block,
-                update_agent_message,
-            )
-
             error_chunk = update_agent_message(text_block(f"⚠️ {self._init_error}"))
-            if self._conn:
+            try:
                 await self._conn.session_update(
                     session_id=session_id,
                     update=error_chunk,
                     source="gptme",
                 )
+            except Exception as e:
+                logger.debug(f"Failed to send init error notification: {e}")
             # Keep _init_error set so prompt() can still surface it for retries
-            # (the user may send a message before the notification is seen)
 
-        # Advertise available slash commands for client-side autocomplete.
-        # NOTE: This is also called at the start of prompt() as a fallback for
-        # clients (like Zed) that may not receive session/update notifications
-        # sent before NewSessionResponse is returned (race condition on session open).
+        # Advertise slash commands for client-side autocomplete.
         await self._send_available_commands(session_id)
-
-        _NewSessionResponse = _check_acp_import(
-            NewSessionResponse, "NewSessionResponse"
-        )
-        return _NewSessionResponse(session_id=session_id)
 
     async def _send_available_commands(self, session_id: str) -> None:
         """Send AvailableCommandsUpdate notification to advertise slash commands.
 
-        Called during new_session() and as a fallback at the start of the first
-        prompt() call. The fallback handles a race condition where some clients
-        (e.g. Zed) may not receive session/update notifications sent before
-        NewSessionResponse is returned.
+        Called from _send_session_open_notifications() (deferred, after session
+        registration) and as a fallback at the start of the first prompt() call.
         """
         if not self._conn or session_id in self._session_commands_advertised:
             return
@@ -603,7 +709,7 @@ class GptmeAgent:
             from ..commands import get_commands_with_descriptions
 
             acp_commands = [
-                AvailableCommand(name=f"/{name}", description=desc)
+                AvailableCommand(name=name, description=desc)
                 for name, desc in get_commands_with_descriptions()
             ]
             await self._conn.session_update(
@@ -765,9 +871,9 @@ class GptmeAgent:
         if self._tools is not None:
             set_tools(self._tools)
 
-        # Resend AvailableCommandsUpdate if not yet acknowledged for this session.
-        # Handles race condition: some clients (e.g. Zed) may not receive
-        # session/update notifications sent before NewSessionResponse returns.
+        # Resend AvailableCommandsUpdate if not yet sent for this session.
+        # Handles the case where the deferred task from new_session() hasn't run yet
+        # (e.g., early first prompt arriving before asyncio.sleep(0) yields).
         await self._send_available_commands(session_id)
 
         session = self._registry.get(session_id)
@@ -866,25 +972,67 @@ class GptmeAgent:
         session_id: str,
         **kwargs: Any,
     ) -> Any:
-        """Load an existing session (Phase 2 feature).
+        """Load an existing session from persistent log storage.
+
+        Looks up the session by conversation ID in the gptme logs directory.
+        If found, restores the LogManager and registers the session.
+        Returns None if the session doesn't exist on disk, letting the client
+        gracefully fall back to creating a new session via new_session().
 
         Args:
-            session_id: Session ID to load
+            session_id: Conversation ID (e.g. "2025-08-30-jumping-orange-walrus")
 
         Returns:
-            Session data or error
+            NewSessionResponse if session found, None otherwise
         """
-        # Phase 2: Implement session persistence
-        logger.warning(f"load_session not yet implemented: {session_id}")
-        raise NotImplementedError("Session loading not yet implemented")
+        if not _import_acp():
+            return None
+
+        # Check if already loaded in-memory
+        if self._registry.get(session_id):
+            logger.info(f"load_session: {session_id[:16]} already in registry")
+            _NewSessionResponse = _check_acp_import(
+                NewSessionResponse, "NewSessionResponse"
+            )
+            return _NewSessionResponse(session_id=session_id)
+
+        # Try to load from persistent storage
+        logs_dir = get_logs_dir()
+        logdir = logs_dir / session_id
+        logfile = logdir / "conversation.jsonl"
+
+        if not logfile.exists():
+            logger.info(f"load_session: {session_id[:16]} not found on disk")
+            return None
+
+        try:
+            log = LogManager.load(
+                logdir=logdir,
+                create=False,
+                lock=False,
+            )
+            self._registry.create(session_id, log=log)
+            logger.info(
+                f"load_session: restored {session_id[:16]} ({len(log.log)} messages)"
+            )
+
+            _NewSessionResponse = _check_acp_import(
+                NewSessionResponse, "NewSessionResponse"
+            )
+            return _NewSessionResponse(session_id=session_id)
+        except Exception as e:
+            logger.warning(f"load_session: failed to load {session_id[:16]}: {e}")
+            return None
 
     def _cleanup_session(self, session_id: str) -> None:
         """Remove all per-session state for a given session.
 
-        Cleans up _session_models, _tool_calls, and _permission_policies
-        to prevent unbounded memory growth from accumulated sessions.
+        Cleans up _session_models, _session_modes, _tool_calls, and
+        _permission_policies to prevent unbounded memory growth from
+        accumulated sessions.
         """
         self._session_models.pop(session_id, None)
+        self._session_modes.pop(session_id, None)
         self._tool_calls.pop(session_id, None)
         self._permission_policies.pop(session_id, None)
         self._session_commands_advertised.discard(session_id)
@@ -909,7 +1057,12 @@ class GptmeAgent:
         cwd: str | None = None,
         **kwargs: Any,
     ) -> Any:
-        """List available sessions."""
+        """List available sessions from persistent storage.
+
+        Returns sessions from disk (gptme logs directory), merged with any
+        active in-memory sessions. Sessions are sorted by modification time
+        (most recent first).
+        """
         if not _import_acp():
             raise RuntimeError("agent-client-protocol package not installed")
         from acp.client.connection import (  # type: ignore[import-not-found]
@@ -917,10 +1070,56 @@ class GptmeAgent:
         )
         from acp.schema import SessionInfo  # type: ignore[import-not-found]
 
-        sessions = self._registry.list_sessions()
-        return ListSessionsResponse(
-            sessions=[SessionInfo(session_id=sid, cwd="") for sid in sessions],
-        )
+        # Get persistent conversations from disk
+        conversations = list_conversations(limit=50)
+
+        # Build session list, merging disk metadata with in-memory state
+        active_ids = set(self._registry.list_sessions())
+        sessions: list[Any] = []
+
+        for conv in conversations:
+            # Prefer in-memory cwd (set at session creation) over disk workspace
+            in_memory = self._registry.get(conv.id)
+            session_cwd = (
+                (in_memory.cwd or "")
+                if in_memory and in_memory.cwd
+                else (conv.workspace if conv.workspace != "." else "")
+            )
+
+            # Apply cwd filter if specified
+            if cwd and session_cwd != cwd:
+                active_ids.discard(conv.id)
+                continue
+
+            sessions.append(
+                SessionInfo(
+                    session_id=conv.id,
+                    cwd=session_cwd,
+                    title=conv.name if conv.name != conv.id else None,
+                    updated_at=datetime.fromtimestamp(
+                        conv.modified, tz=timezone.utc
+                    ).isoformat(),
+                )
+            )
+            active_ids.discard(conv.id)
+
+        # Add any in-memory sessions not yet on disk
+        for sid in active_ids:
+            in_memory = self._registry.get(sid)
+            session_cwd = (in_memory.cwd or "") if in_memory else ""
+            if cwd and session_cwd != cwd:
+                continue
+            sessions.append(
+                SessionInfo(
+                    session_id=sid,
+                    cwd=session_cwd,
+                    updated_at=(
+                        in_memory.last_activity.isoformat() if in_memory else None
+                    ),
+                )
+            )
+
+        return ListSessionsResponse(sessions=sessions)
 
     async def authenticate(
         self,
@@ -948,11 +1147,21 @@ class GptmeAgent:
         session_id: str,
         **kwargs: Any,
     ) -> None:
-        """Set the mode for a session (not supported)."""
-        logger.warning(
-            f"set_session_mode not implemented: session={session_id}, mode={mode_id}"
-        )
-        return
+        """Set the mode for a session.
+
+        Supported modes:
+        - default: Interactive mode (tools require confirmation)
+        - auto: Autonomous mode (tools run without confirmation)
+        """
+        valid_modes = {"default", "auto"}
+        if mode_id not in valid_modes:
+            logger.warning(
+                f"set_session_mode: unknown mode {mode_id!r}, ignoring. "
+                f"Valid modes: {valid_modes}"
+            )
+            return
+        logger.info(f"set_session_mode: session={session_id}, mode={mode_id}")
+        self._session_modes[session_id] = mode_id
 
     async def ext_method(
         self,

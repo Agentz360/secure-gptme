@@ -657,15 +657,15 @@ workspace = "{workspace!s}"
         )
 
         assert config.chat is not None, "Chat config should be loaded"
-        assert (
-            config.chat.model == "openrouter/test-model"
-        ), "Should use saved model when no CLI override"
-        assert (
-            config.chat.tool_format == "xml"
-        ), "Should use saved tool_format when no CLI override"
-        assert config.chat.tools is not None and (
-            "shell" in config.chat.tools
-        ), "Should use saved tools when no CLI override"
+        assert config.chat.model == "openrouter/test-model", (
+            "Should use saved model when no CLI override"
+        )
+        assert config.chat.tool_format == "xml", (
+            "Should use saved tool_format when no CLI override"
+        )
+        assert config.chat.tools is not None and ("shell" in config.chat.tools), (
+            "Should use saved tools when no CLI override"
+        )
 
         # Test 2: Resume with CLI overrides - should use CLI values
         config = setup_config_from_cli(
@@ -680,41 +680,46 @@ workspace = "{workspace!s}"
         )
 
         assert config.chat is not None, "Chat config should be loaded"
-        assert (
-            config.chat.model == "anthropic/claude-3-sonnet"
-        ), "Should use CLI model when provided"
-        assert (
-            config.chat.tool_format == "markdown"
-        ), "Should use CLI tool_format when provided"
+        assert config.chat.model == "anthropic/claude-3-sonnet", (
+            "Should use CLI model when provided"
+        )
+        assert config.chat.tool_format == "markdown", (
+            "Should use CLI tool_format when provided"
+        )
         assert config.chat.tools == [
             "read",
             "save",
         ], "Should use CLI tools when provided"
 
         # Test 3: New conversation (no saved config) - should fall back to env/defaults
+        # Mock model default to None so we test the pure fallback to "markdown"
+        # (otherwise, if the default model has a default_tool_format, that takes precedence)
+        from unittest.mock import patch
+
         new_logdir = Path(tmpdir) / "new-conversation"
         new_logdir.mkdir()
 
-        config = setup_config_from_cli(
-            workspace=workspace,
-            logdir=new_logdir,
-            model=None,  # No CLI override
-            tool_allowlist=None,  # No CLI override
-            tool_format=None,  # No CLI override
-            stream=True,
-            interactive=True,
-            agent_path=None,
-        )
+        with patch("gptme.config._get_model_default_tool_format", return_value=None):
+            config = setup_config_from_cli(
+                workspace=workspace,
+                logdir=new_logdir,
+                model=None,  # No CLI override
+                tool_allowlist=None,  # No CLI override
+                tool_format=None,  # No CLI override
+                stream=True,
+                interactive=True,
+                agent_path=None,
+            )
 
         # For new conversations, should use defaults/env (tool_format defaults to "markdown")
         assert config.chat is not None, "Chat config should be loaded"
-        assert (
-            config.chat.tool_format == "markdown"
-        ), "Should use default tool_format for new conversation"
+        assert config.chat.tool_format == "markdown", (
+            "Should use default tool_format for new conversation"
+        )
         # Model will depend on env vars, so we just check it's not the saved value
-        assert (
-            config.chat.model != "openrouter/test-model"
-        ), "Should not use saved model for new conversation"
+        assert config.chat.model != "openrouter/test-model", (
+            "Should not use saved model for new conversation"
+        )
 
 
 def test_reload_config_clears_tools(monkeypatch, tmp_path):
@@ -908,3 +913,17 @@ def test_user_config_no_local_toml(tmp_path):
     # Should work fine without config.local.toml
     config = Config(user=load_user_config(str(main_config)))
     assert config.user.prompt.about_user == "I am a developer."
+
+
+def test_cli_auto_envvar_prefix():
+    """Test that the main CLI command has auto_envvar_prefix='GPTME' set."""
+    from gptme.cli.main import main
+
+    # Verify the Click command has auto_envvar_prefix configured
+    assert main.context_settings.get("auto_envvar_prefix") == "GPTME"
+
+    # Verify key options would resolve to expected GPTME_* env var names
+    params = {p.name: p for p in main.params}
+    assert "model" in params, "CLI should have --model option"
+    assert "tool_format" in params, "CLI should have --tool-format option"
+    assert "workspace" in params, "CLI should have --workspace option"

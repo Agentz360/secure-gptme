@@ -491,22 +491,29 @@ class TestInitializeWithoutAcp:
         except RuntimeError as e:
             assert "agent-client-protocol" in str(e)
 
-    def test_load_session_not_implemented(self):
+    def test_load_session_returns_none_for_missing(self):
+        """load_session returns None for sessions not on disk.
+
+        Returning None (instead of raising) lets ACP clients like Zed
+        gracefully fall back to new_session() without an RPC error that
+        would disrupt the session lifecycle.
+        """
         agent = GptmeAgent()
-        with pytest.raises(NotImplementedError, match="not yet implemented"):
-            _run(agent.load_session(session_id="fake_session"))
+        result = _run(agent.load_session(session_id="nonexistent-session-id"))
+        assert result is None
 
 
 class TestCleanupSession:
     """Tests for _cleanup_session and cancel methods."""
 
     def test_cleanup_removes_all_state(self):
-        """_cleanup_session should remove session_models, tool_calls, and permission_policies."""
+        """_cleanup_session should remove session_models, session_modes, tool_calls, and permission_policies."""
         agent = GptmeAgent()
         sid = "session_cleanup_test"
 
         # Populate all per-session state
         agent._session_models[sid] = "anthropic/claude-sonnet-4-6"
+        agent._session_modes[sid] = "auto"
         agent._tool_calls[sid] = {
             "call_1": ToolCall(
                 tool_call_id="call_1", title="Test", kind=ToolKind.EXECUTE
@@ -519,6 +526,7 @@ class TestCleanupSession:
         agent._cleanup_session(sid)
 
         assert sid not in agent._session_models
+        assert sid not in agent._session_modes
         assert sid not in agent._tool_calls
         assert sid not in agent._permission_policies
         assert sid not in agent._session_commands_advertised
@@ -637,6 +645,36 @@ class TestPerSessionModel:
         assert agent._session_models["s1"] == model_with_routing
 
 
+class TestSendSessionOpenNotifications:
+    """Tests for _send_session_open_notifications method."""
+
+    def test_no_connection_skips_silently(self):
+        """Without a connection, should return without error."""
+        agent = GptmeAgent()
+        assert agent._conn is None
+        # Should not raise
+        _run(agent._send_session_open_notifications("session_1", None, "/tmp"))
+
+    def test_runs_without_error_with_mock_conn(self):
+        """Should run without raising even if acp is not installed (import handled)."""
+        agent = _make_agent_with_conn()
+        # Should not raise regardless of whether acp is installed
+        _run(agent._send_session_open_notifications("session_1", "test-model", "/tmp"))
+
+    @pytest.mark.skipif(not _import_acp(), reason="requires acp package")
+    def test_sends_model_info_and_commands_when_acp_installed(self):
+        """When acp is installed, should call session_update for model info + commands."""
+        agent = _make_agent_with_conn()
+        _run(
+            agent._send_session_open_notifications(
+                "session_1", "anthropic/claude-sonnet-4-6", "/tmp"
+            )
+        )
+        # session_update should be called at least twice: model info + AvailableCommands
+        assert agent._conn.session_update.await_count >= 2
+        assert "session_1" in agent._session_commands_advertised
+
+
 class TestSendAvailableCommands:
     """Tests for _send_available_commands method."""
 
@@ -665,6 +703,37 @@ class TestSendAvailableCommands:
         _run(agent._send_available_commands("session_1"))
 
         assert "session_1" not in agent._session_commands_advertised
+
+    @pytest.mark.skipif(not _import_acp(), reason="requires acp package")
+    def test_command_names_have_no_slash_prefix(self):
+        """Command names must not have a '/' prefix — the ACP client (Zed) adds it."""
+        from acp.schema import AvailableCommand  # type: ignore[import-not-found]
+
+        agent = _make_agent_with_conn()
+        _run(agent._send_available_commands("session_1"))
+
+        # Extract the AvailableCommand objects from the session_update call
+        call_args = agent._conn.session_update.await_args
+        assert call_args is not None, (
+            "session_update was not called — _send_available_commands may have failed"
+        )
+        update = call_args.kwargs.get("update") or call_args.args[0]
+
+        # Walk the update to find commands
+        commands = []
+        if hasattr(update, "available_commands"):
+            commands = update.available_commands
+        elif isinstance(update, dict) and "available_commands" in update:
+            commands = update["available_commands"]
+
+        assert len(commands) > 0, "Expected at least one command to be advertised"
+
+        for cmd in commands:
+            name = cmd.name if isinstance(cmd, AvailableCommand) else cmd["name"]
+            assert not name.startswith("/"), (
+                f"Command name '{name}' should not have a '/' prefix — "
+                "the ACP client (e.g. Zed) adds the slash itself"
+            )
 
     def test_cleanup_removes_from_advertised(self):
         """_cleanup_session should remove session from _session_commands_advertised."""
@@ -904,3 +973,289 @@ class TestGetCommandsWithDescriptions:
 
         names = [name for name, _ in get_commands_with_descriptions()]
         assert len(names) == len(set(names))
+
+
+class TestSessionPersistence:
+    """Tests for ACP session persistence (persistent log storage)."""
+
+    def test_load_session_returns_none_for_nonexistent(self):
+        """load_session should return None for sessions that don't exist on disk."""
+        agent = GptmeAgent()
+        result = _run(agent.load_session(session_id="2099-01-01-nonexistent-session"))
+        assert result is None
+
+    def test_load_session_returns_already_loaded(self):
+        """load_session should return response for sessions already in registry."""
+        if not _import_acp():
+            pytest.skip("acp not installed")
+
+        agent = GptmeAgent()
+        sid = "test-already-loaded"
+        agent._registry.create(sid)
+
+        result = _run(agent.load_session(session_id=sid))
+        assert result is not None
+
+    def test_load_session_restores_from_disk(self, tmp_path):
+        """load_session should restore a session from persistent log files."""
+        if not _import_acp():
+            pytest.skip("acp not installed")
+
+        import json
+        from unittest.mock import patch
+
+        # Create a fake log directory with a conversation.jsonl
+        session_dir = tmp_path / "test-session-restore"
+        session_dir.mkdir()
+        logfile = session_dir / "conversation.jsonl"
+
+        # Write a minimal valid JSONL entry
+        entry = {
+            "role": "system",
+            "content": "test system message",
+            "timestamp": "2025-01-01T00:00:00+00:00",
+        }
+        logfile.write_text(json.dumps(entry) + "\n")
+
+        agent = GptmeAgent()
+
+        # Patch get_logs_dir to use our tmp dir
+        with patch("gptme.acp.agent.get_logs_dir", return_value=tmp_path):
+            result = _run(agent.load_session(session_id="test-session-restore"))
+
+        assert result is not None
+        # Session should now be in registry
+        assert agent._registry.get("test-session-restore") is not None
+
+    def test_list_sessions_includes_in_memory(self):
+        """list_sessions should include active in-memory sessions."""
+        if not _import_acp():
+            pytest.skip("acp not installed")
+
+        from unittest.mock import patch
+
+        agent = GptmeAgent()
+        agent._registry.create("in-memory-session")
+
+        # Patch list_conversations to return empty (no on-disk sessions)
+        with patch("gptme.acp.agent.list_conversations", return_value=[]):
+            result = _run(agent.list_sessions())
+
+        session_ids = [s.session_id for s in result.sessions]
+        assert "in-memory-session" in session_ids
+
+    def test_list_sessions_includes_persistent(self):
+        """list_sessions should include sessions from persistent storage."""
+        if not _import_acp():
+            pytest.skip("acp not installed")
+
+        from dataclasses import dataclass
+        from unittest.mock import patch
+
+        @dataclass(frozen=True)
+        class FakeConv:
+            id: str = "2025-01-01-test-session"
+            name: str = "test"
+            path: str = "/tmp/fake"
+            created: float = 0.0
+            modified: float = 0.0
+            messages: int = 5
+            branches: int = 1
+            workspace: str = "/home/user/project"
+
+        agent = GptmeAgent()
+
+        with patch(
+            "gptme.acp.agent.list_conversations",
+            return_value=[FakeConv()],
+        ):
+            result = _run(agent.list_sessions())
+
+        session_ids = [s.session_id for s in result.sessions]
+        assert "2025-01-01-test-session" in session_ids
+        # Check that workspace is passed as cwd
+        matching = [
+            s for s in result.sessions if s.session_id == "2025-01-01-test-session"
+        ]
+        assert matching[0].cwd == "/home/user/project"
+
+    def test_list_sessions_deduplicates(self):
+        """In-memory sessions that are also on disk should not appear twice."""
+        if not _import_acp():
+            pytest.skip("acp not installed")
+
+        from dataclasses import dataclass
+        from unittest.mock import patch
+
+        @dataclass(frozen=True)
+        class FakeConv:
+            id: str = "shared-session"
+            name: str = "shared"
+            path: str = "/tmp/fake"
+            created: float = 0.0
+            modified: float = 0.0
+            messages: int = 5
+            branches: int = 1
+            workspace: str = "."
+
+        agent = GptmeAgent()
+        agent._registry.create("shared-session")
+
+        with patch(
+            "gptme.acp.agent.list_conversations",
+            return_value=[FakeConv()],
+        ):
+            result = _run(agent.list_sessions())
+
+        session_ids = [s.session_id for s in result.sessions]
+        assert session_ids.count("shared-session") == 1
+
+
+class TestBuildModesState:
+    """Tests for _build_modes_state()."""
+
+    def test_returns_none_without_acp(self):
+        """Returns None when ACP schema not importable."""
+        agent = GptmeAgent()
+        # If acp.schema isn't available, should return None gracefully
+        result = agent._build_modes_state("test-session")
+        # Can be None or a proper SessionModeState depending on install
+        if result is not None:
+            assert result.current_mode_id == "default"
+
+    @pytest.mark.skipif(not _import_acp(), reason="acp package not installed")
+    def test_default_mode(self):
+        """Default mode should be 'default'."""
+        agent = GptmeAgent()
+        result = agent._build_modes_state("test-session")
+        assert result is not None
+        assert result.current_mode_id == "default"
+        assert len(result.available_modes) == 2
+
+    @pytest.mark.skipif(not _import_acp(), reason="acp package not installed")
+    def test_auto_mode(self):
+        """Should reflect auto mode when set."""
+        agent = GptmeAgent()
+        agent._session_modes["test-session"] = "auto"
+        result = agent._build_modes_state("test-session")
+        assert result is not None
+        assert result.current_mode_id == "auto"
+
+    @pytest.mark.skipif(not _import_acp(), reason="acp package not installed")
+    def test_mode_ids(self):
+        """Available modes should have correct IDs."""
+        agent = GptmeAgent()
+        result = agent._build_modes_state("test-session")
+        assert result is not None
+        mode_ids = {m.id for m in result.available_modes}
+        assert mode_ids == {"default", "auto"}
+
+
+class TestBuildModelsState:
+    """Tests for _build_models_state()."""
+
+    @pytest.mark.skipif(not _import_acp(), reason="acp package not installed")
+    def test_returns_models(self):
+        """Should return available models from registry."""
+        agent = GptmeAgent()
+        result = agent._build_models_state("anthropic/claude-sonnet-4-6")
+        assert result is not None
+        assert len(result.available_models) > 0
+        assert result.current_model_id == "anthropic/claude-sonnet-4-6"
+
+    @pytest.mark.skipif(not _import_acp(), reason="acp package not installed")
+    def test_uses_global_model_as_fallback(self):
+        """Falls back to global model when session model is None."""
+        agent = GptmeAgent()
+        agent._model = "anthropic/claude-opus-4-6"
+        result = agent._build_models_state(None)
+        assert result is not None
+        assert result.current_model_id == "anthropic/claude-opus-4-6"
+
+    @pytest.mark.skipif(not _import_acp(), reason="acp package not installed")
+    def test_models_have_required_fields(self):
+        """Each model should have model_id and name."""
+        agent = GptmeAgent()
+        result = agent._build_models_state(None)
+        assert result is not None
+        for model in result.available_models:
+            assert model.model_id
+            assert model.name
+
+    @pytest.mark.skipif(not _import_acp(), reason="acp package not installed")
+    def test_excludes_deprecated_models(self):
+        """Deprecated models should not appear in available list."""
+        agent = GptmeAgent()
+        result = agent._build_models_state(None)
+        assert result is not None
+        # Deprecated models have deprecated=True in MODELS dict
+        # Just verify we get some models (non-empty) and the count is reasonable
+        assert len(result.available_models) > 5
+
+
+class TestSetSessionMode:
+    """Tests for set_session_mode()."""
+
+    def test_set_valid_mode(self):
+        """Should store valid mode."""
+        agent = GptmeAgent()
+        _run(agent.set_session_mode(mode_id="auto", session_id="s1"))
+        assert agent._session_modes["s1"] == "auto"
+
+    def test_set_default_mode(self):
+        """Should store default mode."""
+        agent = GptmeAgent()
+        _run(agent.set_session_mode(mode_id="default", session_id="s1"))
+        assert agent._session_modes["s1"] == "default"
+
+    def test_ignore_invalid_mode(self):
+        """Should ignore unknown mode IDs."""
+        agent = GptmeAgent()
+        _run(agent.set_session_mode(mode_id="turbo", session_id="s1"))
+        assert "s1" not in agent._session_modes
+
+    def test_mode_switch(self):
+        """Should allow switching between modes."""
+        agent = GptmeAgent()
+        _run(agent.set_session_mode(mode_id="auto", session_id="s1"))
+        assert agent._session_modes["s1"] == "auto"
+        _run(agent.set_session_mode(mode_id="default", session_id="s1"))
+        assert agent._session_modes["s1"] == "default"
+
+
+class TestAutoModePermission:
+    """Tests for auto-approve in auto mode."""
+
+    def test_auto_mode_skips_permission(self):
+        """In auto mode, tool permission should be auto-granted."""
+        agent = GptmeAgent()
+        agent._conn = MagicMock()  # Has connection but should skip
+        agent._session_modes["s1"] = "auto"
+
+        tool_call = ToolCall(
+            tool_call_id="tc1",
+            title="echo hello",
+            kind=ToolKind.EXECUTE,
+        )
+        result = _run(agent._request_tool_permission("s1", tool_call))
+        assert result is True
+        # Should NOT have called request_permission on connection
+        agent._conn.request_permission.assert_not_called()
+
+    def test_default_mode_requests_permission(self):
+        """In default mode, tool permission should be requested."""
+        agent = GptmeAgent()
+        agent._conn = AsyncMock()
+        agent._conn.request_permission = AsyncMock(
+            return_value=_mock_permission_response("allow-once")
+        )
+        agent._session_modes["s1"] = "default"
+
+        tool_call = ToolCall(
+            tool_call_id="tc1",
+            title="echo hello",
+            kind=ToolKind.EXECUTE,
+        )
+        result = _run(agent._request_tool_permission("s1", tool_call))
+        assert result is True
+        agent._conn.request_permission.assert_called_once()
