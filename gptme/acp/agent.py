@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..config import get_project_config
+from ..config import ChatConfig, get_project_config
 from ..dirs import get_logs_dir
 from ..init import init
 from ..llm.models import get_default_model, set_default_model
@@ -32,12 +33,15 @@ from .types import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
     from ..message import Message
 
 logger = logging.getLogger(__name__)
 
 # Lazy imports to avoid dependency issues when acp is not installed
 Agent: type | None = None
+Implementation: type | None = None
 InitializeResponse: type | None = None
 NewSessionResponse: type | None = None
 PromptResponse: type | None = None
@@ -59,7 +63,13 @@ def _check_acp_import(cls: type | None, name: str) -> type:
 
 def _import_acp() -> bool:
     """Import ACP modules lazily."""
-    global Agent, InitializeResponse, NewSessionResponse, PromptResponse, Client
+    global \
+        Agent, \
+        Implementation, \
+        InitializeResponse, \
+        NewSessionResponse, \
+        PromptResponse, \
+        Client
     try:
         from acp import (  # type: ignore[import-not-found]
             Agent as _Agent,
@@ -74,8 +84,12 @@ def _import_acp() -> bool:
             PromptResponse as _PromptResponse,
         )
         from acp.interfaces import Client as _Client  # type: ignore[import-not-found]
+        from acp.schema import (  # type: ignore[import-not-found]
+            Implementation as _Implementation,
+        )
 
         Agent = _Agent
+        Implementation = _Implementation
         InitializeResponse = _InitializeResponse
         NewSessionResponse = _NewSessionResponse
         PromptResponse = _PromptResponse
@@ -83,6 +97,28 @@ def _import_acp() -> bool:
         return True
     except ImportError:
         return False
+
+
+def _agent_info() -> Any:
+    """Build the agentInfo for InitializeResponse."""
+    _Impl = _check_acp_import(Implementation, "Implementation")
+    try:
+        from importlib.metadata import version
+
+        gptme_version = version("gptme")
+    except Exception:
+        gptme_version = "unknown"
+    return _Impl(name="gptme", title="gptme ACP Agent", version=gptme_version)
+
+
+def _cwd_session_id(cwd: str) -> str:
+    """Derive a deterministic session ID from a workspace path.
+
+    Returns a stable ID like ``acp-<hash8>`` so that the same CWD always
+    maps to the same session, enabling session resume across editor restarts.
+    """
+    h = hashlib.sha256(str(Path(cwd).resolve()).encode()).hexdigest()[:8]
+    return f"acp-{h}"
 
 
 class GptmeAgent:
@@ -113,6 +149,10 @@ class GptmeAgent:
         # and the prompt() fallback (in case the deferred notification races
         # with an early first prompt).
         self._session_commands_advertised: set[str] = set()
+        # Background tasks that must be kept alive until completion.
+        # Without storing references, asyncio.create_task() returns tasks that
+        # can be garbage-collected and silently cancelled before finishing.
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
     def on_connect(self, conn: Any) -> None:
         """Called when a client connects.
@@ -121,6 +161,15 @@ class GptmeAgent:
             conn: The client connection for sending notifications.
         """
         self._conn = conn
+
+    def _create_background_task(
+        self, coro: Coroutine[Any, Any, None]
+    ) -> asyncio.Task[None]:
+        """Create a background task with a stored reference to prevent GC cancellation."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     # Phase 2: Tool call methods
 
@@ -219,7 +268,7 @@ class GptmeAgent:
         # Check cached permission policies
         if session_id in self._permission_policies:
             policies = self._permission_policies[session_id]
-            tool_key = f"{tool_call.kind.value}"
+            tool_key = tool_call.kind.value
             if tool_key in policies:
                 return policies[tool_key] == "allow"
 
@@ -261,20 +310,16 @@ class GptmeAgent:
             option_id = outcome.option_id
 
             # Cache always policies
-            if option_id == "allow-always":
-                if session_id not in self._permission_policies:
-                    self._permission_policies[session_id] = {}
-                self._permission_policies[session_id][tool_call.kind.value] = "allow"
-                return True
-            if option_id == "reject-always":
-                if session_id not in self._permission_policies:
-                    self._permission_policies[session_id] = {}
-                self._permission_policies[session_id][tool_call.kind.value] = "reject"
-                return False
+            if option_id in ("allow-always", "reject-always"):
+                policies = self._permission_policies.setdefault(session_id, {})
+                policies[tool_call.kind.value] = (
+                    "allow" if option_id == "allow-always" else "reject"
+                )
+                return option_id == "allow-always"
             return option_id == "allow-once"
 
         except Exception as e:
-            logger.warning(f"Permission request failed: {e}, auto-allowing")
+            logger.warning("Permission request failed: %s, auto-allowing", e)
             return True
 
     def _create_confirm_with_tools(
@@ -374,7 +419,7 @@ class GptmeAgent:
                 )
                 return True
             except Exception as e:
-                logger.warning(f"Tool permission check failed: {e}, auto-allowing")
+                logger.warning("Tool permission check failed: %s, auto-allowing", e)
                 return True
 
         return confirm_callback
@@ -422,8 +467,7 @@ class GptmeAgent:
             InitializeResponse with negotiated protocol version
         """
         if not _import_acp():
-            # Phase 1: Raise exception since we can't construct ACP error response
-            # without the package. Future: Consider early validation in __main__.py
+            # Can't construct ACP error response without the package
             raise RuntimeError(
                 "agent-client-protocol package not installed. "
                 "Install with: pip install 'gptme[acp]'"
@@ -448,7 +492,8 @@ class GptmeAgent:
                 )
                 logger.error(self._init_error)
                 return _check_acp_import(InitializeResponse, "InitializeResponse")(
-                    protocol_version=protocol_version
+                    protocol_version=protocol_version,
+                    agent_info=_agent_info(),
                 )  # type: ignore[misc]
 
             self._initialized = True
@@ -460,11 +505,14 @@ class GptmeAgent:
             # Store tools for re-setting in other handler contexts
             self._tools = get_tools()
 
-        logger.info(f"ACP Initialize: protocol_version={protocol_version}")
+        logger.info("ACP Initialize: protocol_version=%s", protocol_version)
         _InitializeResponse = _check_acp_import(
             InitializeResponse, "InitializeResponse"
         )
-        return _InitializeResponse(protocol_version=protocol_version)
+        return _InitializeResponse(
+            protocol_version=protocol_version,
+            agent_info=_agent_info(),
+        )
 
     async def new_session(
         self,
@@ -472,7 +520,12 @@ class GptmeAgent:
         mcp_servers: list[Any],
         **kwargs: Any,
     ) -> Any:
-        """Create a new gptme session.
+        """Create or resume a gptme session for the given workspace.
+
+        When a CWD is provided, derives a deterministic session ID from the
+        workspace path so that reconnecting clients (e.g. editor restart)
+        automatically resume the previous conversation instead of creating
+        a new one.
 
         Args:
             cwd: Working directory for the session
@@ -507,11 +560,48 @@ class GptmeAgent:
                     f"ACP NewSession: using per-project model {session_model!r} from {cwd}/gptme.toml"
                 )
 
-        # Use conversation ID as session ID for persistence.
-        # This makes sessions discoverable by list_sessions and resumable
-        # by load_session across ACP server restarts.
         logs_dir = get_logs_dir()
-        session_id = generate_conversation_id(name=None, logs_dir=logs_dir)
+        resumed = False
+
+        # --- Session resume: derive a deterministic ID from CWD ---
+        # This ensures the same workspace always maps to the same session,
+        # so editor restarts resume the previous conversation.
+        if cwd:
+            session_id = _cwd_session_id(cwd)
+            logdir = logs_dir / session_id
+            logfile = logdir / "conversation.jsonl"
+
+            # Already loaded in this server process?
+            existing = self._registry.get(session_id)
+            if existing and existing.log is not None:
+                logger.info(
+                    f"ACP NewSession: reusing in-memory session {session_id} for {cwd}"
+                )
+                resumed = True
+                log = existing.log
+            elif logfile.exists():
+                # Resume from disk
+                try:
+                    log = LogManager.load(
+                        logdir=logdir,
+                        create=False,
+                        lock=False,
+                    )
+                    resumed = True
+                    n_msgs = len(log.log)
+                    logger.info(
+                        f"ACP NewSession: resumed session {session_id} from disk "
+                        f"({n_msgs} messages) for {cwd}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"ACP NewSession: failed to load {session_id}: {e}, "
+                        "creating fresh session"
+                    )
+                    resumed = False
+        else:
+            session_id = generate_conversation_id(name=None, logs_dir=logs_dir)
+
         logdir = logs_dir / session_id
 
         # Store per-session model for use in prompt() and other handlers
@@ -521,27 +611,52 @@ class GptmeAgent:
         if session_model and session_model != self._model:
             set_default_model(session_model)
 
-        # Get tools and initial prompt
-        tools = get_tools()
-        initial_msgs = get_prompt(
-            tools=tools,
-            tool_format="markdown",
-            prompt="full",
-            interactive=False,
-            model=session_model,
-            workspace=Path(cwd) if cwd else None,
-        )
+        if not resumed:
+            # Get tools and initial prompt for a fresh session
+            tools = get_tools()
+            initial_msgs = get_prompt(
+                tools=tools,
+                tool_format="markdown",
+                prompt="full",
+                interactive=False,
+                model=session_model,
+                workspace=Path(cwd) if cwd else None,
+            )
 
-        # Create LogManager for this session
-        log = LogManager.load(
-            logdir=logdir,
-            initial_msgs=initial_msgs,
-            create=True,
-            lock=False,
-        )
+            log = LogManager.load(
+                logdir=logdir,
+                initial_msgs=initial_msgs,
+                create=True,
+                lock=False,
+            )
 
-        self._registry.create(session_id, log=log, cwd=str(cwd) if cwd else None)
-        logger.info(f"ACP NewSession: session_id={session_id}, cwd={cwd}")
+        # Persist workspace metadata so list_sessions/list_conversations can
+        # find this session by CWD, and so resumed sessions resolve workspace.
+        if cwd:
+            chat_cfg = ChatConfig(
+                _logdir=logdir,
+                workspace=Path(cwd).resolve(),
+            )
+            try:
+                chat_cfg.save()
+            except Exception as e:
+                logger.debug("Failed to save ChatConfig for %s: %s", session_id, e)
+
+        # Register in the in-memory session registry or update existing
+        existing_session = self._registry.get(session_id)
+        if not existing_session:
+            self._registry.create(session_id, log=log, cwd=str(cwd) if cwd else None)
+        else:
+            # Update log reference if the existing entry has no log (e.g. registry
+            # entry existed with log=None from a prior in-memory registration or
+            # a session resumed from disk when the registry entry lacked a log).
+            if log and existing_session.log is None:
+                existing_session.log = log
+            existing_session.touch()
+
+        logger.info(
+            f"ACP NewSession: session_id={session_id}, cwd={cwd}, resumed={resumed}"
+        )
 
         # Schedule session-open notifications to run AFTER NewSessionResponse is
         # returned. Sending session/update notifications synchronously during
@@ -550,8 +665,10 @@ class GptmeAgent:
         # By deferring with asyncio.sleep(0) we let the event loop flush the
         # response to the socket before sending notifications.
         if self._conn:
-            asyncio.create_task(
-                self._send_session_open_notifications(session_id, session_model, cwd)
+            self._create_background_task(
+                self._send_session_open_notifications(
+                    session_id, session_model, cwd, resumed=resumed
+                )
             )
 
         _NewSessionResponse = _check_acp_import(
@@ -633,7 +750,12 @@ class GptmeAgent:
         )
 
     async def _send_session_open_notifications(
-        self, session_id: str, session_model: str | None, cwd: str
+        self,
+        session_id: str,
+        session_model: str | None,
+        cwd: str,
+        *,
+        resumed: bool = False,
     ) -> None:
         """Send session-open notifications after NewSessionResponse is returned.
 
@@ -662,7 +784,10 @@ class GptmeAgent:
         # Surface model and workspace info immediately in the ACP panel.
         model_info = session_model or "default"
         workspace_info = str(cwd) if cwd else "none"
-        info_text = f"ℹ️ Using model: {model_info}\nUsing workspace: {workspace_info}"
+        status = "Resumed session" if resumed else "New session"
+        info_text = (
+            f"ℹ️ {status}\nUsing model: {model_info}\nUsing workspace: {workspace_info}"
+        )
         info_chunk = update_agent_message(text_block(info_text))
         try:
             await self._conn.session_update(
@@ -671,7 +796,7 @@ class GptmeAgent:
                 source="gptme",
             )
         except Exception as e:
-            logger.debug(f"Failed to send session info notification: {e}")
+            logger.debug("Failed to send session info notification: %s", e)
 
         # Surface initialization errors immediately so the user sees them
         # without having to send a prompt.
@@ -684,7 +809,7 @@ class GptmeAgent:
                     source="gptme",
                 )
             except Exception as e:
-                logger.debug(f"Failed to send init error notification: {e}")
+                logger.debug("Failed to send init error notification: %s", e)
             # Keep _init_error set so prompt() can still surface it for retries
 
         # Advertise slash commands for client-side autocomplete.
@@ -720,11 +845,11 @@ class GptmeAgent:
             self._session_commands_advertised.add(session_id)
             logger.info(
                 f"ACP AvailableCommandsUpdate: sent {len(acp_commands)} commands"
-                f" for session {session_id[:8]}"
+                f" for session {session_id[:16]}"
             )
         except Exception as e:
             # Non-fatal: clients still work without autocomplete
-            logger.warning(f"Failed to send available commands: {e}", exc_info=True)
+            logger.warning("Failed to send available commands: %s", e, exc_info=True)
 
     async def _handle_slash_command(
         self,
@@ -780,7 +905,7 @@ class GptmeAgent:
                     log.append(resp)
                     response_msgs.append(resp)
         except Exception as e:
-            logger.exception(f"Error executing slash command {msg.content!r}: {e}")
+            logger.exception("Error executing slash command %r: %s", msg.content, e)
             error_text = f"Error executing command: {e}"
             error_chunk = update_agent_message(text_block(error_text))
             if self._conn:
@@ -796,7 +921,12 @@ class GptmeAgent:
         output_parts: list[str] = []
         stdout_output = captured.getvalue()
         if stdout_output:
-            output_parts.append(stdout_output.rstrip())
+            # Wrap multi-line stdout in a code block to preserve formatting
+            # (e.g. /help, /tools output rendered as Markdown in ACP panels)
+            text = stdout_output.rstrip()
+            if "\n" in text:
+                text = f"```\n{text}\n```"
+            output_parts.append(text)
         output_parts.extend(
             resp_msg.content for resp_msg in response_msgs if resp_msg.content
         )
@@ -878,7 +1008,7 @@ class GptmeAgent:
 
         session = self._registry.get(session_id)
         if not session:
-            logger.error(f"Unknown session: {session_id}")
+            logger.error("Unknown session: %s", session_id)
             _PromptResponse = _check_acp_import(PromptResponse, "PromptResponse")
             return _PromptResponse(stop_reason="cancelled")
         # Update last_activity timestamp for cleanup tracking
@@ -893,7 +1023,7 @@ class GptmeAgent:
 
         content_preview = msg.content[:100] if msg.content else ""
         logger.info(
-            f"ACP Prompt: session={session_id[:8]}, content={content_preview}..."
+            f"ACP Prompt: session={session_id[:16]}, content={content_preview}..."
         )
 
         # Handle slash commands before passing to the LLM.
@@ -953,7 +1083,7 @@ class GptmeAgent:
             return _PromptResponse(stop_reason="end_turn")
 
         except Exception as e:
-            logger.exception(f"Error processing prompt: {e}")
+            logger.exception("Error processing prompt: %s", e)
             # Phase 2: Mark tool calls as failed on error
             await self._complete_pending_tool_calls(session_id, success=False)
             # Send error message
@@ -990,11 +1120,8 @@ class GptmeAgent:
 
         # Check if already loaded in-memory
         if self._registry.get(session_id):
-            logger.info(f"load_session: {session_id[:16]} already in registry")
-            _NewSessionResponse = _check_acp_import(
-                NewSessionResponse, "NewSessionResponse"
-            )
-            return _NewSessionResponse(session_id=session_id)
+            logger.info("load_session: %s already in registry", session_id[:16])
+            return self._build_load_session_response(session_id)
 
         # Try to load from persistent storage
         logs_dir = get_logs_dir()
@@ -1002,7 +1129,7 @@ class GptmeAgent:
         logfile = logdir / "conversation.jsonl"
 
         if not logfile.exists():
-            logger.info(f"load_session: {session_id[:16]} not found on disk")
+            logger.info("load_session: %s not found on disk", session_id[:16])
             return None
 
         try:
@@ -1016,13 +1143,43 @@ class GptmeAgent:
                 f"load_session: restored {session_id[:16]} ({len(log.log)} messages)"
             )
 
-            _NewSessionResponse = _check_acp_import(
-                NewSessionResponse, "NewSessionResponse"
-            )
-            return _NewSessionResponse(session_id=session_id)
+            return self._build_load_session_response(session_id)
         except Exception as e:
-            logger.warning(f"load_session: failed to load {session_id[:16]}: {e}")
+            logger.warning("load_session: failed to load %s: %s", session_id[:16], e)
             return None
+
+    def _build_load_session_response(self, session_id: str) -> Any:
+        """Build a NewSessionResponse for a loaded session with modes and models.
+
+        Ensures loaded sessions get the same modes/models state as new sessions,
+        and schedules deferred notifications (available commands, model info).
+        """
+        _NewSessionResponse = _check_acp_import(
+            NewSessionResponse, "NewSessionResponse"
+        )
+
+        # Initialize per-session model if not already set
+        session_model = self._session_models.setdefault(session_id, self._model)
+
+        # Build modes and models state (same as new_session)
+        modes = self._build_modes_state(session_id)
+        models = self._build_models_state(session_model)
+
+        # Schedule deferred notifications (commands, model info)
+        session = self._registry.get(session_id)
+        cwd = (session.cwd or "") if session else ""
+        if self._conn:
+            self._create_background_task(
+                self._send_session_open_notifications(
+                    session_id, session_model, cwd, resumed=True
+                )
+            )
+
+        return _NewSessionResponse(
+            session_id=session_id,
+            modes=modes,
+            models=models,
+        )
 
     def _cleanup_session(self, session_id: str) -> None:
         """Remove all per-session state for a given session.
@@ -1048,7 +1205,7 @@ class GptmeAgent:
         Args:
             session_id: Session to cancel
         """
-        logger.info(f"Cancelling session {session_id}")
+        logger.info("Cancelling session %s", session_id)
         self._cleanup_session(session_id)
 
     async def list_sessions(
@@ -1127,7 +1284,7 @@ class GptmeAgent:
         **kwargs: Any,
     ) -> None:
         """Handle authentication request (not supported)."""
-        logger.warning(f"authenticate not implemented: {method_id}")
+        logger.warning("authenticate not implemented: %s", method_id)
         return
 
     async def set_session_model(
@@ -1137,7 +1294,7 @@ class GptmeAgent:
         **kwargs: Any,
     ) -> None:
         """Set the model for a specific session."""
-        logger.info(f"set_session_model: session={session_id}, model={model_id}")
+        logger.info("set_session_model: session=%s, model=%s", session_id, model_id)
         self._session_models[session_id] = model_id
         return
 
@@ -1160,7 +1317,7 @@ class GptmeAgent:
                 f"Valid modes: {valid_modes}"
             )
             return
-        logger.info(f"set_session_mode: session={session_id}, mode={mode_id}")
+        logger.info("set_session_mode: session=%s, mode=%s", session_id, mode_id)
         self._session_modes[session_id] = mode_id
 
     async def ext_method(
@@ -1169,7 +1326,7 @@ class GptmeAgent:
         params: dict[str, Any],
     ) -> dict[str, Any]:
         """Handle extension method calls."""
-        logger.warning(f"ext_method not implemented: {method}")
+        logger.warning("ext_method not implemented: %s", method)
         return {}
 
     async def ext_notification(
@@ -1178,7 +1335,7 @@ class GptmeAgent:
         params: dict[str, Any],
     ) -> None:
         """Handle extension notifications."""
-        logger.debug(f"ext_notification: {method}")
+        logger.debug("ext_notification: %s", method)
 
 
 def create_agent() -> GptmeAgent:

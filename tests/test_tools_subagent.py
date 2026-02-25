@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -500,7 +502,9 @@ def test_subprocess_mode_command_construction():
     assert "gptme" in captured_cmd
     assert "-n" in captured_cmd  # Non-interactive
     assert "--no-confirm" in captured_cmd
-    assert "Test prompt for command" in captured_cmd
+    assert (
+        "Test prompt for command" not in captured_cmd
+    )  # Prompt passed via stdin, not argv
 
 
 def test_subprocess_mode_completion_stored():
@@ -620,7 +624,7 @@ def test_subprocess_command_includes_required_flags():
             assert any("--logdir=" in str(arg) for arg in cmd)
             assert "--model" in cmd
             assert "test-model" in cmd
-            assert "Test task" in cmd  # The prompt
+            assert "Test task" not in cmd  # Prompt passed via stdin, not argv
 
         finally:
             process.terminate()
@@ -825,3 +829,370 @@ def test_subprocess_mode_read_log():
     assert isinstance(log_content, str)
     # Log should exist and have content (at minimum the conversation start)
     assert len(log_content) > 0
+
+
+# Profile integration tests
+
+
+@patch("gptme.tools.subagent._create_subagent_thread")
+def test_subagent_with_profile(mock_create_thread: MagicMock):
+    """Test that profile parameter is passed to subagent thread."""
+    initial_count = len(_subagents)
+
+    subagent(
+        agent_id="test-profile",
+        prompt="Explore the codebase",
+        profile="explorer",
+    )
+
+    assert len(_subagents) == initial_count + 1
+
+    # Verify profile was passed to _create_subagent_thread
+    mock_create_thread.assert_called_once()
+    call_kwargs = mock_create_thread.call_args[1]
+    assert call_kwargs["profile_name"] == "explorer"
+
+
+@patch("gptme.tools.subagent._create_subagent_thread")
+def test_subagent_with_model_override(mock_create_thread: MagicMock):
+    """Test that model parameter overrides parent's model."""
+    initial_count = len(_subagents)
+
+    subagent(
+        agent_id="test-model-override",
+        prompt="Quick task",
+        model="openai/gpt-4o-mini",
+    )
+
+    assert len(_subagents) == initial_count + 1
+
+    # Verify model override is used
+    executor = _subagents[-1]
+    assert executor.model == "openai/gpt-4o-mini"
+
+
+@patch("gptme.tools.subagent._create_subagent_thread")
+def test_subagent_with_profile_and_model(mock_create_thread: MagicMock):
+    """Test combining profile and model parameters."""
+    initial_count = len(_subagents)
+
+    subagent(
+        agent_id="test-profile-model",
+        prompt="Research task",
+        profile="researcher",
+        model="anthropic/claude-haiku",
+    )
+
+    assert len(_subagents) == initial_count + 1
+
+    # Verify both profile and model are passed
+    mock_create_thread.assert_called_once()
+    call_kwargs = mock_create_thread.call_args[1]
+    assert call_kwargs["profile_name"] == "researcher"
+    assert call_kwargs["model"] == "anthropic/claude-haiku"
+
+
+@patch("gptme.tools.subagent._create_subagent_thread")
+def test_planner_with_profile(mock_create_thread: MagicMock):
+    """Test that planner mode passes profile to executor subagents."""
+    initial_count = len(_subagents)
+
+    subtasks: list[SubtaskDef] = [
+        {"id": "explore1", "description": "Explore module A"},
+        {"id": "explore2", "description": "Explore module B"},
+    ]
+
+    subagent(
+        agent_id="test-planner-profile",
+        prompt="Explore the codebase",
+        mode="planner",
+        subtasks=subtasks,
+        profile="explorer",
+    )
+
+    assert len(_subagents) == initial_count + 2
+
+    # Verify profile was passed to each executor's _create_subagent_thread call
+    assert mock_create_thread.call_count == 2
+    for call in mock_create_thread.call_args_list:
+        assert call[1]["profile_name"] == "explorer"
+
+
+@patch("gptme.tools.subagent._create_subagent_thread")
+def test_subagent_auto_detects_profile_from_agent_id(mock_create_thread: MagicMock):
+    """Test that agent_id matching a profile name auto-applies the profile."""
+    initial_count = len(_subagents)
+
+    # Use "explorer" as agent_id without explicit profile param
+    subagent(
+        agent_id="explorer",
+        prompt="Analyze the architecture",
+    )
+
+    assert len(_subagents) == initial_count + 1
+
+    # Profile should be auto-detected from agent_id
+    mock_create_thread.assert_called_once()
+    call_kwargs = mock_create_thread.call_args[1]
+    assert call_kwargs["profile_name"] == "explorer"
+
+
+@patch("gptme.tools.subagent._create_subagent_thread")
+def test_subagent_auto_detects_profile_alias_from_agent_id(
+    mock_create_thread: MagicMock,
+):
+    """Test that common agent_id aliases map to expected profiles."""
+    initial_count = len(_subagents)
+
+    subagent(
+        agent_id="impl",
+        prompt="Implement feature X",
+    )
+
+    assert len(_subagents) == initial_count + 1
+
+    # Profile should be auto-detected from alias
+    mock_create_thread.assert_called_once()
+    call_kwargs = mock_create_thread.call_args[1]
+    assert call_kwargs["profile_name"] == "developer"
+
+
+@patch("gptme.tools.subagent._create_subagent_thread")
+def test_subagent_no_auto_detect_for_unknown_agent_id(mock_create_thread: MagicMock):
+    """Test that non-profile agent_ids don't trigger auto-detection."""
+    initial_count = len(_subagents)
+
+    subagent(
+        agent_id="my-custom-task",
+        prompt="Do something",
+    )
+
+    assert len(_subagents) == initial_count + 1
+
+    # No profile should be set
+    mock_create_thread.assert_called_once()
+    call_kwargs = mock_create_thread.call_args[1]
+    assert call_kwargs["profile_name"] is None
+
+
+@patch("gptme.tools.subagent._create_subagent_thread")
+def test_subagent_explicit_profile_overrides_auto_detect(
+    mock_create_thread: MagicMock,
+):
+    """Test that explicit profile param takes precedence over agent_id matching."""
+    initial_count = len(_subagents)
+
+    # agent_id is "explorer" but explicit profile is "researcher"
+    subagent(
+        agent_id="explorer",
+        prompt="Research task",
+        profile="researcher",
+    )
+
+    assert len(_subagents) == initial_count + 1
+
+    # Explicit profile should win
+    mock_create_thread.assert_called_once()
+    call_kwargs = mock_create_thread.call_args[1]
+    assert call_kwargs["profile_name"] == "researcher"
+
+
+def test_subagent_profile_parameter_exists():
+    """Test that subagent function accepts profile and model parameters."""
+    import inspect
+
+    sig = inspect.signature(subagent)
+
+    assert "profile" in sig.parameters
+    assert sig.parameters["profile"].default is None
+
+    assert "model" in sig.parameters
+    assert sig.parameters["model"].default is None
+
+
+def test_profile_hard_tool_enforcement():
+    """Test that profile tool restrictions are hard-enforced via set_tools().
+
+    Verifies that when a profile restricts tools, set_tools() is called
+    to replace the loaded tools, so execute_msg() can only run allowed tools.
+    """
+    import gptme
+    import gptme.chat
+    import gptme.executor
+    import gptme.llm.models
+    from gptme.tools import set_tools as real_set_tools
+    from gptme.tools.base import ToolSpec
+
+    mock_tools = [
+        ToolSpec(name="read", desc="Read files", instructions=""),
+        ToolSpec(name="shell", desc="Run shell", instructions=""),
+        ToolSpec(name="save", desc="Save files", instructions=""),
+        ToolSpec(name="chats", desc="Chat management", instructions=""),
+        ToolSpec(name="complete", desc="Signal completion", instructions=""),
+    ]
+
+    # Track calls to set_tools
+    set_tools_calls: list[list[str]] = []
+
+    def spy_set_tools(tools):
+        set_tools_calls.append([t.name for t in tools])
+        real_set_tools(tools)
+
+    with (
+        patch.object(gptme.tools.subagent, "set_tools", spy_set_tools),
+        patch.object(gptme.tools.subagent, "get_tools", return_value=mock_tools),
+        patch.object(sys.modules["gptme"], "chat"),
+        patch.object(
+            gptme.executor,
+            "prepare_execution_environment",
+            return_value=(MagicMock(), mock_tools),
+        ),
+        patch.object(gptme.llm.models, "set_default_model"),
+    ):
+        from gptme.tools.subagent import _create_subagent_thread
+
+        _create_subagent_thread(
+            prompt="Read the codebase",
+            logdir=Path("/tmp/test-enforcement"),
+            model=None,
+            context_mode="instructions-only",
+            context_include=None,
+            workspace=Path("/tmp"),
+            profile_name="explorer",
+        )
+
+    # set_tools should have been called with only allowed tools
+    assert len(set_tools_calls) == 1, f"set_tools called {len(set_tools_calls)} times"
+    enforced_tools = set_tools_calls[0]
+
+    # Explorer profile allows: read, chats (+ complete always included)
+    assert "read" in enforced_tools
+    assert "chats" in enforced_tools
+    assert "complete" in enforced_tools
+    assert "shell" not in enforced_tools, "shell should be blocked by explorer profile"
+    assert "save" not in enforced_tools, "save should be blocked by explorer profile"
+
+
+def test_profile_no_restriction_skips_set_tools():
+    """Test that profiles without tool restrictions don't call set_tools."""
+    import gptme
+    import gptme.chat
+    import gptme.executor
+    import gptme.llm.models
+    from gptme.tools.base import ToolSpec
+
+    mock_tools = [
+        ToolSpec(name="read", desc="Read files", instructions=""),
+        ToolSpec(name="shell", desc="Run shell", instructions=""),
+        ToolSpec(name="complete", desc="Signal completion", instructions=""),
+    ]
+
+    set_tools_calls: list[list[str]] = []
+
+    def spy_set_tools(tools):
+        set_tools_calls.append([t.name for t in tools])
+
+    with (
+        patch.object(gptme.tools.subagent, "set_tools", spy_set_tools),
+        patch.object(gptme.tools.subagent, "get_tools", return_value=mock_tools),
+        patch.object(sys.modules["gptme"], "chat"),
+        patch.object(
+            gptme.executor,
+            "prepare_execution_environment",
+            return_value=(MagicMock(), mock_tools),
+        ),
+        patch.object(gptme.llm.models, "set_default_model"),
+    ):
+        from gptme.tools.subagent import _create_subagent_thread
+
+        # developer profile has tools=None (no restrictions)
+        _create_subagent_thread(
+            prompt="Write some code",
+            logdir=Path("/tmp/test-no-restrict"),
+            model=None,
+            context_mode="instructions-only",
+            context_include=None,
+            workspace=Path("/tmp"),
+            profile_name="developer",
+        )
+
+    # set_tools should NOT have been called (no restrictions to enforce)
+    assert len(set_tools_calls) == 0, (
+        f"set_tools should not be called for developer profile, but was called {len(set_tools_calls)} times"
+    )
+
+
+def test_subprocess_mode_with_profile():
+    """Test that subprocess mode passes profile via --agent-profile flag."""
+    captured_cmd: list[str] = []
+
+    def capture_popen(cmd, **kwargs):
+        captured_cmd.clear()
+        captured_cmd.extend(cmd)
+        mock = MagicMock()
+        mock.poll.return_value = None
+        return mock
+
+    _subagents.clear()
+
+    with patch("gptme.tools.subagent.subprocess.Popen", side_effect=capture_popen):
+        subagent(
+            agent_id="test-subprocess-profile",
+            prompt="Explore task",
+            use_subprocess=True,
+            profile="explorer",
+        )
+
+    # Verify --agent-profile flag is in the command
+    assert "--agent-profile" in captured_cmd
+    profile_idx = captured_cmd.index("--agent-profile")
+    assert captured_cmd[profile_idx + 1] == "explorer"
+
+
+def test_create_subagent_thread_warns_on_unknown_profile_tools(mocker, tmp_path):
+    """Warn when profile includes unknown tool names and keep known ones + complete."""
+    from gptme.message import Message
+    from gptme.profiles import Profile
+    from gptme.tools.base import ToolSpec
+    from gptme.tools.subagent import _create_subagent_thread
+
+    profile = Profile(
+        name="test",
+        description="test profile",
+        tools=["read", "reead"],
+    )
+    tools = [
+        ToolSpec(name="read", desc=""),
+        ToolSpec(name="complete", desc=""),
+        ToolSpec(name="shell", desc=""),
+    ]
+
+    mocker.patch("gptme.profiles.get_profile", return_value=profile)
+    mocker.patch("gptme.tools.subagent.get_tools", return_value=tools)
+    mocker.patch("gptme.executor.prepare_execution_environment")
+    mock_prompt = mocker.patch("gptme.prompts.get_prompt", return_value=[])
+    mock_chat = mocker.patch("gptme.chat")
+    mock_warn = mocker.patch("gptme.tools.subagent.logger.warning")
+
+    _create_subagent_thread(
+        prompt="test",
+        logdir=tmp_path,
+        model=None,
+        context_mode="full",
+        context_include=None,
+        workspace=tmp_path,
+        profile_name="test",
+    )
+
+    mock_warn.assert_called_once()
+    assert "unknown tools" in mock_warn.call_args.args[0]
+    assert "reead" in mock_warn.call_args.args[2]
+
+    # Ensure tools passed to prompt are filtered to allowed + complete fallback
+    filtered_tools = mock_prompt.call_args.args[0]
+    filtered_names = {t.name for t in filtered_tools}
+    assert filtered_names == {"read", "complete"}
+
+    # Ensure chat got the user prompt message
+    prompt_msgs = mock_chat.call_args.args[0]
+    assert prompt_msgs == [Message("user", "test")]
