@@ -74,10 +74,26 @@ _subagent_results_lock = threading.Lock()
 
 # Thread-safe queue for completed subagent notifications
 # Each entry is (agent_id, status, summary)
-_completion_queue: queue.Queue[tuple[str, str, str]] = queue.Queue()
+_completion_queue: queue.Queue[tuple[str, Status, str]] = queue.Queue()
 
 
-def notify_completion(agent_id: str, status: str, summary: str) -> None:
+def _get_complete_instruction(target: str = "orchestrator") -> str:
+    """Get the standard instruction for using the complete tool.
+
+    Used by both thread and subprocess modes to ensure consistent behavior.
+    The instruction is intentionally minimal - profile system prompts and
+    task context should guide what the complete answer should contain.
+    """
+    return (
+        "When finished, use the `complete` tool with your full answer/result.\n"
+        f"Include everything the {target} needs - they shouldn't need to read the full log.\n"
+        "```complete\n"
+        "Your complete answer here.\n"
+        "```"
+    )
+
+
+def notify_completion(agent_id: str, status: Status, summary: str) -> None:
     """Add a subagent completion to the notification queue.
 
     Called by the monitor thread when a subagent finishes. The queued
@@ -201,7 +217,11 @@ class Subagent:
 
         if complete_tool:
             # Extract content from complete tool
-            result = complete_tool.content or "Task completed"
+            # Don't silently fall back - make it clear when no summary was provided
+            if complete_tool.content and complete_tool.content.strip():
+                result = complete_tool.content.strip()
+            else:
+                result = "Task completed (no summary provided)"
             return ReturnType(
                 "success",
                 result + f"\n\nFull log: {self.logdir}",
@@ -216,7 +236,11 @@ class Subagent:
                 r"```complete\s*\n(.*?)\n```", last_msg.content, re.DOTALL
             )
             if match:
-                result = match.group(1).strip() or "Task completed"
+                content = match.group(1).strip()
+                if content:
+                    result = content
+                else:
+                    result = "Task completed (no summary provided)"
                 return ReturnType(
                     "success",
                     result + f"\n\nFull log: {self.logdir}",
@@ -436,11 +460,7 @@ def _create_subagent_thread(
     # Add completion instruction as a system message
     complete_instruction = Message(
         "system",
-        "When you have finished the task, use the `complete` tool to signal completion:\n"
-        "```complete\n"
-        "Brief summary of what was accomplished.\n"
-        "```\n\n"
-        f"This signals task completion. The full conversation log will be available to the {target} for review.",
+        _get_complete_instruction(target),
     )
     initial_msgs.append(complete_instruction)
 
@@ -497,7 +517,7 @@ def _run_subagent_subprocess(
         "gptme",
         "-n",  # Non-interactive
         "--no-confirm",
-        f"--logdir={logdir}",
+        f"--name={logdir.name}",  # Just the folder name, not full path
     ]
 
     if model:
@@ -547,6 +567,13 @@ def _run_subagent_subprocess(
             f"{memory_dir}/MEMORY.md\n"
         )
         prompt = prompt + memory_section
+
+    # Add completion instruction to the prompt for subprocess mode
+    # (In thread mode, this is added as a system message)
+    complete_section = (
+        f"\n\n[Completion Instructions]\n{_get_complete_instruction('orchestrator')}\n"
+    )
+    prompt = prompt + complete_section
 
     # Pass prompt via stdin (piped from a temp file) instead of as a CLI argument.
     # This avoids ARG_MAX limits for large prompts and keeps argv clean.
@@ -785,7 +812,7 @@ def subagent(
             - Tool access restrictions (which tools the subagent can use)
             - Behavior rules (read-only, no-network, etc.)
             Use 'gptme-util profile list' to see available profiles.
-            Built-in profiles: default, explorer, researcher, developer, isolated.
+            Built-in profiles: default, explorer, researcher, developer, isolated, computer-use, browser-use.
             If not set, auto-detected from agent_id when it matches a profile name.
         model: Model to use for the subagent. Overrides parent's model.
             Useful for routing cheap tasks to faster/cheaper models.
@@ -977,7 +1004,7 @@ def subagent(
                 # If subagent creation fails, notify with error status
                 logger.error(f"Subagent {agent_id} failed during execution: {e}")
                 try:
-                    notify_completion(agent_id, "error", f"Execution failed: {e}")
+                    notify_completion(agent_id, "failure", f"Execution failed: {e}")
                 except Exception as notify_err:
                     logger.warning(f"Failed to notify subagent error: {notify_err}")
                 # Clean up worktree isolation even on failure
@@ -1057,6 +1084,7 @@ def subagent_wait(agent_id: str, timeout: int = 60) -> dict:
         except subprocess.TimeoutExpired:
             logger.warning(f"Subagent {agent_id} timed out after {timeout}s")
             sa.process.kill()
+            sa.process.wait()  # reap the killed process
     elif sa.thread:
         # Thread mode: join thread
         sa.thread.join(timeout=timeout)
@@ -1426,9 +1454,13 @@ When agent_id matches a profile name, the profile is auto-applied:
 - researcher: Web research without file modification (tools: browser, read)
 - developer: Full development capabilities (all tools)
 - isolated: Restricted processing for untrusted content (tools: read, ipython)
+- computer-use: Visual UI testing specialist (tools: computer, vision, ipython, shell)
+- browser-use: Web interaction and testing specialist (tools: browser, screenshot, vision, shell)
 
 Example: `subagent("explorer", "Explore codebase")`
 With model override: `subagent("researcher", "Find docs", model="openai/gpt-4o-mini")`
+Computer-use example: `subagent("computer-use", "Click the Submit button, wait for the modal, and screenshot the result")`
+Browser-use example: `subagent("browser-use", "Open localhost:5173, take a screenshot, and report UI issues")`
 
 Use subagent_read_log() to inspect a subagent's conversation log for debugging.
 

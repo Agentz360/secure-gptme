@@ -106,6 +106,26 @@ class TestBuiltinProfiles:
         assert developer.tools is None
         assert developer.behavior.read_only is False
 
+    def test_computer_use_profile(self):
+        computer_use = BUILTIN_PROFILES["computer-use"]
+
+        assert computer_use.name == "computer-use"
+        assert computer_use.tools is not None
+        assert "computer" in computer_use.tools
+        assert "vision" in computer_use.tools
+        assert "ipython" in computer_use.tools
+        assert "shell" in computer_use.tools
+
+    def test_browser_use_profile(self):
+        browser_use = BUILTIN_PROFILES["browser-use"]
+
+        assert browser_use.name == "browser-use"
+        assert browser_use.tools is not None
+        assert "browser" in browser_use.tools
+        assert "screenshot" in browser_use.tools
+        assert "vision" in browser_use.tools
+        assert "shell" in browser_use.tools
+
 
 class TestGetProfile:
     """Tests for get_profile function."""
@@ -195,6 +215,36 @@ class TestInvalidToolsType:
         with pytest.raises(TypeError, match="must be a list"):
             Profile.from_dict(data)
 
+    def test_tools_as_int_raises(self):
+        """Passing tools as an int should raise TypeError."""
+        data = {
+            "name": "bad",
+            "description": "Bad profile",
+            "tools": 42,
+        }
+        with pytest.raises(TypeError, match="must be a list"):
+            Profile.from_dict(data)
+
+    def test_tools_as_bool_raises(self):
+        """Passing tools as a bool should raise TypeError."""
+        data = {
+            "name": "bad",
+            "description": "Bad profile",
+            "tools": True,
+        }
+        with pytest.raises(TypeError, match="must be a list"):
+            Profile.from_dict(data)
+
+    def test_tools_as_dict_raises(self):
+        """Passing tools as a dict should raise TypeError."""
+        data = {
+            "name": "bad",
+            "description": "Bad profile",
+            "tools": {"read": True},
+        }
+        with pytest.raises(TypeError, match="must be a list"):
+            Profile.from_dict(data)
+
     def test_tools_as_string_in_markdown(self, tmp_path):
         """Markdown profile with tools as bare string raises on parse."""
         profile_md = tmp_path / "bad.md"
@@ -219,6 +269,17 @@ class TestInvalidToolsType:
         }
         profile = Profile.from_dict(data)
         assert profile.tools == ["shell"]
+
+    def test_tools_empty_list_works(self):
+        """Passing tools as empty list (no tools) works and is distinct from None."""
+        data = {
+            "name": "no-tools",
+            "description": "No tools profile",
+            "tools": [],
+        }
+        profile = Profile.from_dict(data)
+        assert profile.tools == []
+        assert profile.tools is not None
 
     def test_tools_none_works(self):
         """Passing tools as None (all tools) works."""
@@ -367,6 +428,24 @@ class TestMarkdownProfiles:
 
         assert len(profiles) == 1
         assert "good" in profiles
+
+    def test_parse_markdown_profile_with_bom(self, tmp_path):
+        """Markdown profile with UTF-8 BOM is parsed correctly."""
+        profile_md = tmp_path / "bom.md"
+        profile_md.write_bytes(
+            b"\xef\xbb\xbf"  # UTF-8 BOM
+            b"---\n"
+            b"name: bom-profile\n"
+            b"description: Profile with BOM\n"
+            b"---\n"
+            b"\n"
+            b"Has a BOM.\n"
+        )
+
+        profile = _parse_markdown_profile(profile_md)
+
+        assert profile.name == "bom-profile"
+        assert profile.system_prompt == "Has a BOM."
 
     def test_markdown_profile_full_behavior(self, tmp_path):
         """All behavior fields are parsed correctly."""

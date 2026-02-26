@@ -78,12 +78,12 @@ class Profile:
         behavior = ProfileBehavior(**behavior_data)
         profile_data = {k: v for k, v in data.items() if k != "behavior"}
 
-        # Validate tools field type: must be a list or None, not a bare string
+        # Validate tools field type: must be a list or None
         tools = profile_data.get("tools")
-        if isinstance(tools, str):
+        if tools is not None and not isinstance(tools, list):
             raise TypeError(
                 f"Profile '{data.get('name', '?')}': "
-                f"'tools' must be a list (e.g. ['read', 'shell']), got string '{tools}'"
+                f"'tools' must be a list (e.g. ['read', 'shell']), got {type(tools).__name__}"
             )
 
         return cls(behavior=behavior, **profile_data)
@@ -163,6 +163,38 @@ BUILTIN_PROFILES: dict[str, Profile] = {
         tools=["read", "ipython"],
         behavior=ProfileBehavior(read_only=True, no_network=True),
     ),
+    "computer-use": Profile(
+        name="computer-use",
+        description="Computer-use specialist for visual UI testing and desktop interaction",
+        system_prompt=(
+            "You are in COMPUTER-USE mode, specialized for visual UI testing and "
+            "desktop interaction. Prioritize efficient, evidence-first workflows:\n"
+            "- Use the computer tool for screenshots, mouse, keyboard, and UI navigation\n"
+            "- Keep screenshot loops focused and concise\n"
+            "- Prefer returning structured findings (issues, repro steps, logs)\n"
+            "- When used as a subagent, keep parent context lean by summarizing key results\n"
+            "- Avoid unnecessary file modifications unless explicitly requested\n"
+        ),
+        tools=["computer", "vision", "ipython", "shell"],
+        behavior=ProfileBehavior(),
+    ),
+    "browser-use": Profile(
+        name="browser-use",
+        description="Browser-use specialist for web interaction and testing",
+        system_prompt=(
+            "You are in BROWSER-USE mode, specialized for web browsing and "
+            "interaction. Prioritize efficient, evidence-first workflows:\n"
+            "- Use the browser tool for navigating websites and web applications\n"
+            "- Take screenshots to verify visual state and capture evidence\n"
+            "- Prefer returning structured findings (issues, repro steps, observations)\n"
+            "- When used as a subagent, keep parent context lean by summarizing key results\n"
+            "- Avoid unnecessary file modifications unless explicitly requested\n"
+        ),
+        # ipython required: browser functions (read_url, screenshot_url, etc.) are
+        # Python functions callable via ipython, not standalone tools
+        tools=["browser", "screenshot", "vision", "ipython", "shell"],
+        behavior=ProfileBehavior(),
+    ),
 }
 
 
@@ -198,7 +230,7 @@ def _parse_markdown_profile(path: Path) -> Profile:
             "PyYAML is required for markdown profiles. Install with: pip install pyyaml"
         )
 
-    content = path.read_text(encoding="utf-8")
+    content = path.read_text(encoding="utf-8").lstrip("\ufeff")
 
     if not content.startswith("---"):
         raise ValueError(f"Markdown profile must start with YAML frontmatter: {path}")
