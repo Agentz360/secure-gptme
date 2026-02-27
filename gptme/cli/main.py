@@ -23,7 +23,6 @@ except ImportError:
 
 import gptme
 
-from .. import __version__
 from ..chat import chat
 from ..commands import _gen_help
 from ..config import setup_config_from_cli
@@ -39,6 +38,7 @@ from ..telemetry import init_telemetry, shutdown_telemetry
 from ..tools import ToolFormat, get_available_tools, init_tools
 from ..util import epoch_to_age
 from ..util.auto_naming import generate_conversation_id
+from ..util.context import md_codeblock
 from ..util.interrupt import handle_keyboard_interrupt, set_interruptible
 from ..util.prompt import add_history
 
@@ -126,7 +126,19 @@ Examples:
 
 \b
 The interface provides /commands during a conversation:
-{commands_help}"""
+{commands_help}
+
+\b
+Utilities (gptme-util):
+  gptme-util tools list       List all tools and their availability
+  gptme-util tools info TOOL  Show detailed tool instructions/examples
+  gptme-util chats list       List past conversations
+  gptme-util chats search Q   Search conversations for query
+  gptme-util models list      List available models
+  gptme-util context index    Index project files for RAG
+  gptme-util llm generate     Direct LLM generation without chat
+
+Run 'gptme-util --help' for all utility commands."""
 
 
 @click.command(help=docstring, context_settings={"auto_envvar_prefix": "GPTME"})
@@ -242,6 +254,13 @@ The interface provides /commands during a conversation:
     help="Show version and configuration information",
 )
 @click.option(
+    "--version-json",
+    "version_json",
+    is_flag=True,
+    hidden=True,
+    help="Show version info as JSON (for scripting)",
+)
+@click.option(
     "--profile",
     is_flag=True,
     help="Enable profiling and save results to gptme-profile-{timestamp}.prof",
@@ -291,6 +310,7 @@ def main(
     non_interactive: bool,
     show_hidden: bool,
     version: bool,
+    version_json: bool,
     resume: bool,
     workspace: str | None,
     agent_path: str | None,
@@ -405,14 +425,15 @@ def main(
         atexit.register(save_profile)
 
     interactive = not non_interactive
-    if version:
-        # print version
+    if version or version_json:
+        from ..info import format_version_info
 
-        print(f"gptme v{__version__}")
-
-        # print dirs
-        print(f"Logs dir: {get_logs_dir()}")
-
+        print(format_version_info(verbose=verbose, output_json=version_json))
+        
+        # hint about utilities (non-JSON only)
+        if not version_json:
+            print()
+            print("Utilities: gptme-util (run 'gptme-util --help' for more)")
         exit(0)
 
     if "PYTEST_CURRENT_TEST" in os.environ:
@@ -466,7 +487,7 @@ def main(
         # if piped input, append it to first prompt, or create a new prompt if none exists
         if not piped_input:
             return prompt_msgs
-        stdin_msg = Message("user", f"```stdin\n{piped_input}\n```")
+        stdin_msg = Message("user", md_codeblock("stdin", piped_input))
         if not prompt_msgs:
             prompt_msgs.append(stdin_msg)
         else:
