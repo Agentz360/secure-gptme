@@ -49,7 +49,7 @@ tomlkit = "*"
 typing-extensions = "*"
 platformdirs = "^4.3"
 lxml = "*"
-pypdf = ">=5.1.0"  # For PDF text extraction in browser tool
+pypdf = ">=6.7.3"  # For PDF text extraction in browser tool (CVE fix: RAM exhaustion + infinite loop)
 requests = "^2.32"  # For HTTP requests in browser tool (PDF detection)
 json-repair = "^0.32.0"
 mcp = "^1.13.0"
@@ -116,6 +116,7 @@ openapi-spec-validator = "^0.7.2"
 
 # test
 pytest = "^8.0"
+pytest-asyncio = "*"
 pytest-cov = "*"
 pytest-xdist = "^3.5.0"
 pytest-profiling = "^1.7.0"
@@ -256,6 +257,10 @@ module = "sounddevice.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = "acp.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "flask.*"
 ignore_missing_imports = true
 
@@ -280,7 +285,13 @@ ignore_missing_imports = true
 module = "datasets.*"
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = "acp.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "eval: marks tests as evals (deselect with '-m \"not eval\"'), these may fail, and will not run in CI",
